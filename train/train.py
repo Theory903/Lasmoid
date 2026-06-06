@@ -391,209 +391,219 @@ def train():
     device_type = "cuda" if "cuda" in str(device) else ("cpu" if "cpu" in str(device) else None)
     autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type else contextlib.nullcontext()
     
-    for step in range(args_cli.max_iters):
-        # LR Scheduling (Warmup + Cosine Decay)
-        lr_mult = get_lr_multiplier(step, args_cli.max_iters, args_cli.warmup_steps)
-        for g in opt_muon.param_groups:
-            g['lr'] = 2e-3 * lr_mult
-        for g in opt_adamw.param_groups:
-            g['lr'] = args_cli.learning_rate * lr_mult
+    try:
+        for step in range(args_cli.max_iters):
+            # LR Scheduling (Warmup + Cosine Decay)
+            lr_mult = get_lr_multiplier(step, args_cli.max_iters, args_cli.warmup_steps)
+            for g in opt_muon.param_groups:
+                g['lr'] = 2e-3 * lr_mult
+            for g in opt_adamw.param_groups:
+                g['lr'] = args_cli.learning_rate * lr_mult
 
-        if args_cli.rl_grpo:
-            # ─── GRPO Reinforcement Learning Step ───
-            # 1. Get batch of sequences, extract prompt sections
-            xb, yb, _ = get_batch('train')
-            prompt_len = max_seq_len // 2
-            prompts = xb[:, :prompt_len] # [B, prompt_len]
-            
-            # Repeat prompts to group size G to execute in a single forward pass
-            G = args_cli.group_size
-            prompts_expanded = prompts.repeat_interleave(G, dim=0) # [B * G, prompt_len]
-            
-            # Generate completions autoregressively
-            raw_model.eval()
-            with torch.no_grad():
-                completion_len = max_seq_len - prompt_len
-                # pad_token = 1 for the new tokenizer
-                generated_seqs = raw_model.generate(prompts_expanded, completion_len, temperature=1.0, pad_token=eos_token_id)
-            raw_model.train()
-            
-            # Extract completions
-            completions = generated_seqs[:, prompt_len:]
-            
-            # 2. Score completions via reasoning/self-evolution reward alignment
-            rewards = []
-            for b_g in range(args_cli.batch_size * G):
-                comp_tokens = completions[b_g].tolist()
-                text = enc.decode(comp_tokens)
-                rewards.append(reasoning_self_evolution_reward(text))
+            if args_cli.rl_grpo:
+                # ─── GRPO Reinforcement Learning Step ───
+                # 1. Get batch of sequences, extract prompt sections
+                xb, yb, _ = get_batch('train')
+                prompt_len = max_seq_len // 2
+                prompts = xb[:, :prompt_len] # [B, prompt_len]
                 
-            rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
-            
-            # 3. Compute relative advantages within each prompt group
-            rewards_grouped = rewards.view(args_cli.batch_size, G)
-            mean_rewards = rewards_grouped.mean(dim=-1, keepdim=True)
-            std_rewards = rewards_grouped.std(dim=-1, keepdim=True) + 1e-8
-            advantages = ((rewards_grouped - mean_rewards) / std_rewards).view(-1) # [B * G]
-            
-            # 4. Old policy logprob calculation
-            raw_model.eval()
-            with torch.no_grad():
+                # Repeat prompts to group size G to execute in a single forward pass
+                G = args_cli.group_size
+                prompts_expanded = prompts.repeat_interleave(G, dim=0) # [B * G, prompt_len]
+                
+                # Generate completions autoregressively
+                raw_model.eval()
+                with torch.no_grad():
+                    completion_len = max_seq_len - prompt_len
+                    # pad_token = 1 for the new tokenizer
+                    generated_seqs = raw_model.generate(prompts_expanded, completion_len, temperature=1.0, pad_token=eos_token_id)
+                raw_model.train()
+                
+                # Extract completions
+                completions = generated_seqs[:, prompt_len:]
+                
+                # 2. Score completions via reasoning/self-evolution reward alignment
+                rewards = []
+                for b_g in range(args_cli.batch_size * G):
+                    comp_tokens = completions[b_g].tolist()
+                    text = enc.decode(comp_tokens)
+                    rewards.append(reasoning_self_evolution_reward(text))
+                    
+                rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
+                
+                # 3. Compute relative advantages within each prompt group
+                rewards_grouped = rewards.view(args_cli.batch_size, G)
+                mean_rewards = rewards_grouped.mean(dim=-1, keepdim=True)
+                std_rewards = rewards_grouped.std(dim=-1, keepdim=True) + 1e-8
+                advantages = ((rewards_grouped - mean_rewards) / std_rewards).view(-1) # [B * G]
+                
+                # 4. Old policy logprob calculation
+                raw_model.eval()
+                with torch.no_grad():
+                    with autocast_ctx:
+                        logits_old, _, _, _, _, _, _, _ = model(generated_seqs, generated_seqs)
+                        logits_old_shifted = logits_old[:, :-1, :]
+                        targets_shifted = generated_seqs[:, 1:]
+                        
+                        logprobs_old = F.log_softmax(logits_old_shifted, dim=-1)
+                        old_logprobs = logprobs_old.gather(2, targets_shifted.unsqueeze(-1)).squeeze(-1)
+                raw_model.train()
+                
+                # 5. Policy optimization step
+                opt_muon.zero_grad()
+                opt_adamw.zero_grad()
+                
                 with autocast_ctx:
-                    logits_old, _, _, _, _, _, _, _ = model(generated_seqs, generated_seqs)
-                    logits_old_shifted = logits_old[:, :-1, :]
+                    logits, _, _, _, routing_maps, _, adjs, event_probs = model(generated_seqs, generated_seqs)
+                    logits_shifted = logits[:, :-1, :]
                     targets_shifted = generated_seqs[:, 1:]
                     
-                    logprobs_old = F.log_softmax(logits_old_shifted, dim=-1)
-                    old_logprobs = logprobs_old.gather(2, targets_shifted.unsqueeze(-1)).squeeze(-1)
-            raw_model.train()
-            
-            # 5. Policy optimization step
-            opt_muon.zero_grad()
-            opt_adamw.zero_grad()
-            
-            with autocast_ctx:
-                logits, _, _, _, routing_maps, _, adjs, event_probs = model(generated_seqs, generated_seqs)
-                logits_shifted = logits[:, :-1, :]
-                targets_shifted = generated_seqs[:, 1:]
-                
-                # Loss mask: only calculate loss on the generated completion part
-                grpo_loss_mask = torch.zeros_like(targets_shifted, dtype=torch.float32)
-                grpo_loss_mask[:, prompt_len - 1:] = 1.0
-                
-                total_grpo, policy_loss, kl_loss = compute_grpo_loss(
-                    logits_shifted, targets_shifted, advantages, old_logprobs,
-                    loss_mask=grpo_loss_mask, clip_eps=args_cli.clip_eps, kl_coeff=args_cli.kl_coeff
-                )
-                
-                # Concept, routing, and self-modeling auxiliary losses
-                vq_losses = [raw_model.last_vq_loss]
-                concept_aux_loss = 0.0
-                for r in routing_maps:
-                    mean_routing = r.mean(dim=(0, 1))
-                    concept_aux_loss += mean_routing.var()
-                total_vq_loss = sum(vq_losses)
-                graph_loss = sum(torch.mean(torch.abs(a)) for a in adjs) if adjs else torch.tensor(0.0, device=device)
-                
-                pred_coeff = getattr(model_args, 'predictive_coding_coeff', 0.01)
-                token_concept_coeff = getattr(model_args, 'token_concept_loss_coeff', 0.05)
-                loss = (
-                    total_grpo
-                    + raw_model.last_moe_loss
-                    + (0.5 * concept_aux_loss)
-                    + total_vq_loss
-                    + (0.01 * graph_loss)
-                    + pred_coeff * raw_model.last_pred_loss
-                    + token_concept_coeff * raw_model.last_token_concept_loss
-                )
-            
-            if not torch.isfinite(loss):
-                if master_process:
-                    print(f"Step {step:4d} | non-finite GRPO loss, skipping optimizer step", flush=True)
-                opt_muon.zero_grad(set_to_none=True)
-                opt_adamw.zero_grad(set_to_none=True)
-                continue
-
-            loss.backward()
-            
-            # Gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            opt_muon.step()
-            opt_adamw.step()
-            
-            total_step_loss = loss.item()
-            total_step_ce = policy_loss.item()
-            total_step_mtp = kl_loss.item()
-            total_step_vq = rewards.mean().item()  # Display average reward for RL step display
-
-        else:
-            # ─── Standard SFT step with loss masking ───
-            opt_muon.zero_grad()
-            opt_adamw.zero_grad()
-
-            total_step_loss = 0.0
-            total_step_ce = 0.0
-            total_step_mtp = 0.0
-            total_step_vq = 0.0
-            total_step_pred = 0.0
-
-            # Gradient Accumulation Loop
-            for micro in range(args_cli.grad_accum):
-                xb, yb, loss_mask = get_batch('train')
-                
-                # Forward pass under mixed precision
-                with autocast_ctx:
-                    logits, mtp_logits, _, _, routing_maps, _, adjs, event_probs = model(xb, xb)
+                    # Loss mask: only calculate loss on the generated completion part
+                    grpo_loss_mask = torch.zeros_like(targets_shifted, dtype=torch.float32)
+                    grpo_loss_mask[:, prompt_len - 1:] = 1.0
                     
-                    # Autoregressive loss computation with mask
-                    main_loss = compute_loss(
-                        logits,
-                        yb,
-                        routing_maps,
-                        [raw_model.last_vq_loss],
-                        adjs,
-                        event_probs,
-                        loss_mask=loss_mask,
-                        moe_aux_loss=raw_model.last_moe_loss,
-                        token_concept_loss=raw_model.last_token_concept_loss,
-                        token_concept_coeff=getattr(model_args, 'token_concept_loss_coeff', 0.05),
+                    total_grpo, policy_loss, kl_loss = compute_grpo_loss(
+                        logits_shifted, targets_shifted, advantages, old_logprobs,
+                        loss_mask=grpo_loss_mask, clip_eps=args_cli.clip_eps, kl_coeff=args_cli.kl_coeff
                     )
                     
-                    # Next-token prediction loss for display
-                    ce_loss_next = F.cross_entropy(logits.view(-1, model_args.vocab_size), yb.view(-1))
-                    
-                    # MTP (next-next token) loss
-                    ce_loss_mtp = torch.tensor(0.0, device=device)
-                    if mtp_logits is not None:
-                        ce_loss_mtp = F.cross_entropy(
-                            mtp_logits.view(-1, model_args.vocab_size),
-                            yb[:, 1:].contiguous().view(-1)
-                        )
+                    # Concept, routing, and self-modeling auxiliary losses
+                    vq_losses = [raw_model.last_vq_loss]
+                    concept_aux_loss = 0.0
+                    for r in routing_maps:
+                        mean_routing = r.mean(dim=(0, 1))
+                        concept_aux_loss += mean_routing.var()
+                    total_vq_loss = sum(vq_losses)
+                    graph_loss = sum(torch.mean(torch.abs(a)) for a in adjs) if adjs else torch.tensor(0.0, device=device)
                     
                     pred_coeff = getattr(model_args, 'predictive_coding_coeff', 0.01)
-                    loss = main_loss + 0.3 * ce_loss_mtp + pred_coeff * raw_model.last_pred_loss
-                    loss = loss / args_cli.grad_accum
+                    token_concept_coeff = getattr(model_args, 'token_concept_loss_coeff', 0.05)
+                    loss = (
+                        total_grpo
+                        + raw_model.last_moe_loss
+                        + (0.5 * concept_aux_loss)
+                        + total_vq_loss
+                        + (0.01 * graph_loss)
+                        + pred_coeff * raw_model.last_pred_loss
+                        + token_concept_coeff * raw_model.last_token_concept_loss
+                    )
                 
                 if not torch.isfinite(loss):
                     if master_process:
-                        print(f"Step {step:4d} micro {micro} | non-finite SFT loss, skipping microbatch", flush=True)
+                        print(f"Step {step:4d} | non-finite GRPO loss, skipping optimizer step", flush=True)
                     opt_muon.zero_grad(set_to_none=True)
                     opt_adamw.zero_grad(set_to_none=True)
                     continue
 
                 loss.backward()
+                
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                opt_muon.step()
+                opt_adamw.step()
+                
+                total_step_loss = loss.item()
+                total_step_ce = policy_loss.item()
+                total_step_mtp = kl_loss.item()
+                total_step_vq = rewards.mean().item()  # Display average reward for RL step display
 
-                total_step_loss += loss.item() * args_cli.grad_accum
-                total_step_ce += ce_loss_next.item()
-                total_step_mtp += ce_loss_mtp.item()
-                total_step_vq += raw_model.last_vq_loss.item()
-                total_step_pred += raw_model.last_pred_loss.item()
-
-            # Gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-            # Step optimizers
-            opt_muon.step()
-            opt_adamw.step()
-
-        if step % 20 == 0 and master_process:
-            if args_cli.rl_grpo:
-                print(f"Step {step:4d} | Total Loss: {total_step_loss:.4f} | Policy Loss: {total_step_ce:.4f} | KL Loss: {total_step_mtp:.4f} | Avg Reward: {total_step_vq:.4f} | LR Scale: {lr_mult:.4f}", flush=True)
             else:
-                print(f"Step {step:4d} | Total Loss: {total_step_loss:.4f} | CE (t+1): {total_step_ce:.4f} | MTP (t+2): {total_step_mtp:.4f} | VQ Loss: {total_step_vq:.4f} | Pred Loss: {total_step_pred:.4f} | LR Scale: {lr_mult:.4f}", flush=True)
+                # ─── Standard SFT step with loss masking ───
+                opt_muon.zero_grad()
+                opt_adamw.zero_grad()
 
-        # Checkpoint Saving
-        if step > 0 and step % args_cli.save_interval == 0 and master_process:
-            ckpt_path = os.path.join(args_cli.checkpoint_dir, f"lasmoid_step_{step}.pt")
-            torch.save({
-                'step': step,
-                'model_state_dict': raw_model.state_dict(),
-                'opt_muon_state': opt_muon.state_dict(),
-                'opt_adamw_state': opt_adamw.state_dict(),
-                'args': model_args
-            }, ckpt_path)
-            print(f"Checkpoint saved to {ckpt_path}")
+                total_step_loss = 0.0
+                total_step_ce = 0.0
+                total_step_mtp = 0.0
+                total_step_vq = 0.0
+                total_step_pred = 0.0
+
+                # Gradient Accumulation Loop
+                for micro in range(args_cli.grad_accum):
+                    xb, yb, loss_mask = get_batch('train')
+                    
+                    # Forward pass under mixed precision
+                    with autocast_ctx:
+                        logits, mtp_logits, _, _, routing_maps, _, adjs, event_probs = model(xb, xb)
+                        
+                        # Autoregressive loss computation with mask
+                        main_loss = compute_loss(
+                            logits,
+                            yb,
+                            routing_maps,
+                            [raw_model.last_vq_loss],
+                            adjs,
+                            event_probs,
+                            loss_mask=loss_mask,
+                            moe_aux_loss=raw_model.last_moe_loss,
+                            token_concept_loss=raw_model.last_token_concept_loss,
+                            token_concept_coeff=getattr(model_args, 'token_concept_loss_coeff', 0.05),
+                        )
+                        
+                        # Next-token prediction loss for display
+                        ce_loss_next = F.cross_entropy(logits.view(-1, model_args.vocab_size), yb.view(-1))
+                        
+                        # MTP (next-next token) loss
+                        ce_loss_mtp = torch.tensor(0.0, device=device)
+                        if mtp_logits is not None:
+                            ce_loss_mtp = F.cross_entropy(
+                                mtp_logits.view(-1, model_args.vocab_size),
+                                yb[:, 1:].contiguous().view(-1)
+                            )
+                        
+                        pred_coeff = getattr(model_args, 'predictive_coding_coeff', 0.01)
+                        loss = main_loss + 0.3 * ce_loss_mtp + pred_coeff * raw_model.last_pred_loss
+                        loss = loss / args_cli.grad_accum
+                    
+                    if not torch.isfinite(loss):
+                        if master_process:
+                            print(f"Step {step:4d} micro {micro} | non-finite SFT loss, skipping microbatch", flush=True)
+                        opt_muon.zero_grad(set_to_none=True)
+                        opt_adamw.zero_grad(set_to_none=True)
+                        continue
+
+                    loss.backward()
+
+                    total_step_loss += loss.item() * args_cli.grad_accum
+                    total_step_ce += ce_loss_next.item()
+                    total_step_mtp += ce_loss_mtp.item()
+                    total_step_vq += raw_model.last_vq_loss.item()
+                    total_step_pred += raw_model.last_pred_loss.item()
+
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                # Step optimizers
+                opt_muon.step()
+                opt_adamw.step()
+
+            if step % 20 == 0 and master_process:
+                if args_cli.rl_grpo:
+                    print(f"Step {step:4d} | Total Loss: {total_step_loss:.4f} | Policy Loss: {total_step_ce:.4f} | KL Loss: {total_step_mtp:.4f} | Avg Reward: {total_step_vq:.4f} | LR Scale: {lr_mult:.4f}", flush=True)
+                else:
+                    print(f"Step {step:4d} | Total Loss: {total_step_loss:.4f} | CE (t+1): {total_step_ce:.4f} | MTP (t+2): {total_step_mtp:.4f} | VQ Loss: {total_step_vq:.4f} | Pred Loss: {total_step_pred:.4f} | LR Scale: {lr_mult:.4f}", flush=True)
+
+            # Checkpoint Saving
+            if step > 0 and step % args_cli.save_interval == 0 and master_process:
+                ckpt_path = os.path.join(args_cli.checkpoint_dir, f"lasmoid_step_{step}.pt")
+                torch.save({
+                    'step': step,
+                    'model_state_dict': raw_model.state_dict(),
+                    'opt_muon_state': opt_muon.state_dict(),
+                    'opt_adamw_state': opt_adamw.state_dict(),
+                    'args': model_args
+                }, ckpt_path)
+                print(f"Checkpoint saved to {ckpt_path}")
+    except KeyboardInterrupt:
+        if master_process:
+            print("\nTraining interrupted by user. Saving latest parameters before exit...")
+            interrupted_path = os.path.join(args_cli.checkpoint_dir, "lasmoid_interrupted.pt")
+            torch.save(raw_model.state_dict(), interrupted_path)
+            print(f"Interrupted weights saved to {interrupted_path}")
+        if ddp:
+            dist.destroy_process_group()
+        sys.exit(0)
 
     # Save final model
     if master_process:
