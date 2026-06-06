@@ -26,9 +26,22 @@ except ImportError:
 
 import transformers
 
-def setup_tokenizer(lasmoid_dir):
-    print(f"Loading local tokenizer from: {lasmoid_dir}")
-    tokenizer = transformers.PreTrainedTokenizerFast.from_pretrained(lasmoid_dir, fix_mistral_regex=True)
+def setup_tokenizer(tokenizer_path):
+    print(f"Loading tokenizer from: {tokenizer_path}")
+    try:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer_path)
+    except Exception as e:
+        print(f"Standard AutoTokenizer failed to load ({e}). Falling back to PreTrainedTokenizerFast...")
+        try:
+            tokenizer = transformers.PreTrainedTokenizerFast.from_pretrained(tokenizer_path, fix_mistral_regex=True)
+        except Exception as e_fast:
+            print(f"Error: Failed to load tokenizer from '{tokenizer_path}'.")
+            print(f"Detailed error: {e_fast}")
+            print("\nIf you are loading a gated Hugging Face model (such as Gemma), make sure:")
+            print("1. You have accepted the license terms on Hugging Face model page.")
+            print("2. You are logged in using 'huggingface-cli login' or have set 'HF_TOKEN' environment variable.")
+            sys.exit(1)
+
     if tokenizer.eos_token_id is None:
         tokenizer.eos_token_id = 1
     if tokenizer.pad_token_id is None:
@@ -138,9 +151,16 @@ def process_dataset():
         default=None,
         help="Limit the number of examples to process (useful for testing)."
     )
+    parser.add_argument(
+        "--tokenizer_path",
+        type=str,
+        default=None,
+        help="Path or HuggingFace identifier for the tokenizer (e.g. google/gemma-4-12B)."
+    )
     args = parser.parse_args()
     
-    tokenizer = setup_tokenizer(lasmoid_dir)
+    tokenizer_path = args.tokenizer_path if args.tokenizer_path else lasmoid_dir
+    tokenizer = setup_tokenizer(tokenizer_path)
     
     print(f"\nPreparing dataset: {args.dataset.upper()}")
     
