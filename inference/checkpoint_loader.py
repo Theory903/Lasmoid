@@ -159,6 +159,27 @@ def load_checkpoint_and_model(
     model = Lasmoid(model_args).to(device)
 
     if state_dict is not None:
+        if getattr(model_args, "use_mxfp4_weights", False):
+            try:
+                from .kernel import load_mxfp4_weight
+            except ImportError:
+                from kernel import load_mxfp4_weight
+
+            keys_to_dequant = []
+            for key in list(state_dict.keys()):
+                if key.endswith(".blocks"):
+                    base_key = key[:-7]
+                    scales_key = base_key + ".scales"
+                    if scales_key in state_dict:
+                        keys_to_dequant.append((base_key, key, scales_key))
+
+            for base_key, blocks_key, scales_key in keys_to_dequant:
+                blocks_tensor = state_dict.pop(blocks_key)
+                scales_tensor = state_dict.pop(scales_key)
+                dequantized = load_mxfp4_weight(blocks_tensor, scales_tensor, dtype=torch.bfloat16)
+                state_dict[base_key] = dequantized
+                print(f"[checkpoint] Dequantized MXFP4 weight for {base_key}")
+
         if allow_partial_load:
             print(
                 "[checkpoint] WARNING: partial checkpoint load enabled; "

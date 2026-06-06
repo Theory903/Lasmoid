@@ -354,3 +354,73 @@ class DeepSeekMoE(nn.Module):
             + self.capacity_loss_coeff * capacity_overflow
         )
         return y.reshape(shape), aux
+
+    def quantize_routed_experts_to_nvfp4(self) -> None:
+        """Quantize routed expert weights to simulated NVFP4 E2M1 format in-place."""
+        for expert in self.experts:
+            for linear_layer in [expert.w1, expert.w3, expert.w2]:
+                q_weight, scale = quantize_weight_to_nvfp4(linear_layer.weight.data, block_size=32)
+                linear_layer.weight.data.copy_(q_weight)
+                linear_layer.scale = nn.Parameter(scale, requires_grad=False)
+                linear_layer.weight.use_fp4_weights = True
+                linear_layer.weight.scale = linear_layer.scale
+
+    def quantize_routed_experts_to_fp8(self) -> None:
+        """Quantize routed expert weights to FP8 E4M3 format in-place."""
+        for expert in self.experts:
+            for linear_layer in [expert.w1, expert.w3, expert.w2]:
+                q_weight, scale = quantize_weight_to_fp8(linear_layer.weight.data, block_size=128)
+                linear_layer.weight = nn.Parameter(q_weight, requires_grad=linear_layer.weight.requires_grad)
+                linear_layer.scale = nn.Parameter(scale, requires_grad=False)
+                linear_layer.weight.scale = linear_layer.scale
+
+    def quantize_shared_expert_to_fp8(self) -> None:
+        """Quantize shared expert weights to FP8 E4M3 format in-place."""
+        for linear_layer in [self.shared.w1, self.shared.w3, self.shared.w2]:
+            q_weight, scale = quantize_weight_to_fp8(linear_layer.weight.data, block_size=128)
+            linear_layer.weight = nn.Parameter(q_weight, requires_grad=linear_layer.weight.requires_grad)
+            linear_layer.scale = nn.Parameter(scale, requires_grad=False)
+            linear_layer.weight.scale = linear_layer.scale
+
+
+def quantize_weight_to_nvfp4(
+    weight: torch.Tensor, block_size: int = 32
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize weight tensor to simulated NVFP4 E2M1 format with block scales."""
+    fp4_max = 6.0
+    shape = weight.shape
+    out_features, in_features = shape
+
+    actual_block_size = block_size
+    while in_features % actual_block_size != 0 and actual_block_size > 1:
+        actual_block_size //= 2
+
+    w_flat = weight.reshape(-1, actual_block_size).float()
+    amax = w_flat.abs().amax(dim=-1, keepdim=True).clamp(min=fp4_max * 2**-126)
+    s_flat = torch.pow(2.0, torch.ceil(torch.log2(amax / fp4_max)))
+
+    fp4_vals = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+    ]
+    fp4_values = torch.tensor(fp4_vals, device=weight.device, dtype=torch.float32)
+    scaled = (w_flat / s_flat).clamp(-fp4_max, fp4_max)
+    dist = (scaled.unsqueeze(-1) - fp4_values).abs()
+    y_fp4 = fp4_values[dist.argmin(-1)]
+
+    quantized_weight = y_fp4.reshape(shape).to(weight.dtype)
+    scale = s_flat.reshape(out_features, in_features // actual_block_size).to(weight.dtype)
+    return quantized_weight, scale
+
+
+def quantize_weight_to_fp8(
+    weight: torch.Tensor, block_size: int = 128
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize weight tensor to FP8 E4M3 format with block scales."""
+    try:
+        from .kernel import act_quant
+    except ImportError:
+        from kernel import act_quant
+    y_out, s_out = act_quant(weight.contiguous(), block_size=block_size)
+    return y_out, s_out
+

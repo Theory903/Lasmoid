@@ -42,6 +42,15 @@ scale_dtype: torch.dtype = torch.float32
 block_size: int = 128
 fp4_block_size: int = 32
 
+# Einsum parameterization global flag (Gemma-4)
+_use_einsum: bool = False
+
+
+def set_use_einsum(val: bool) -> None:
+    """Toggle einsum parameterization for Linear layers globally."""
+    global _use_einsum
+    _use_einsum = val
+
 
 @contextmanager
 def set_dtype(dtype):
@@ -79,6 +88,11 @@ def _linear_dispatch(
     x: torch.Tensor, weight: nn.Parameter, bias: Optional[nn.Parameter] = None
 ) -> torch.Tensor:
     if weight.dtype == torch.bfloat16 or weight.dtype == torch.float32:
+        if getattr(weight, "use_fp4_weights", False):
+            out = fp4_gemm(x, None, weight, getattr(weight, "scale", None)).to(x.dtype)
+            if bias is not None:
+                out = out + bias
+            return out
         return F.linear(x.to(weight.dtype), weight, bias)
     if weight.dtype == torch.float8_e4m3fn:
         xq, xs = act_quant(
@@ -134,6 +148,13 @@ class Linear(nn.Module):
             nn.init.zeros_(self.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _use_einsum and self.weight.dtype in (torch.bfloat16, torch.float32):
+            # Einsum path (Gemma-4): weight is (out, in), use od->...o equation
+            x = x.to(self.weight.dtype)
+            out = torch.einsum("...d,od->...o", x, self.weight)
+            if self.bias is not None:
+                out = out + self.bias
+            return out
         return _linear_dispatch(x, self.weight, self.bias)
 
 

@@ -90,11 +90,18 @@ try:
     from .attention import (
         CSAAttention,
         HCAAttention,
+        HybridSlidingGlobal,
         MLAAttention,
         precompute_freqs_cis,
     )
 except ImportError:
-    from attention import CSAAttention, HCAAttention, MLAAttention, precompute_freqs_cis
+    from attention import (
+        CSAAttention,
+        HCAAttention,
+        HybridSlidingGlobal,
+        MLAAttention,
+        precompute_freqs_cis,
+    )
 
 # ── MHC (Manifold Hyper-Connections) ────────────────────────────────────────
 try:
@@ -126,11 +133,28 @@ try:
 except ImportError:
     from lasmoid import Lasmoid  # type: ignore[import]
 
+# ── Vision / Audio Encoders ──────────────────────────────────────────────────
+try:
+    from .vision import LasmoidVisionEncoder
+except ImportError:
+    from vision import LasmoidVisionEncoder
+
+try:
+    from .audio import LasmoidAudioEncoder
+except ImportError:
+    from audio import LasmoidAudioEncoder
+
 # ── Loss Functions ──────────────────────────────────────────────────────────
 try:
     from .loss import compute_loss, compute_grpo_loss
 except ImportError:
     from loss import compute_loss, compute_grpo_loss  # type: ignore[import]
+
+# ── Einsum Layers ───────────────────────────────────────────────────────────
+try:
+    from ._layers import EinsumLinear
+except ImportError:
+    from _layers import EinsumLinear  # type: ignore[import]
 
 # ── Compressor ──────────────────────────────────────────────────────────────
 try:
@@ -140,9 +164,37 @@ except ImportError:
 
 # ── KV Cache ────────────────────────────────────────────────────────────────
 try:
-    from .kv_cache import KVCache, SlidingWindowKVCache
+    from .kv_cache import KVCache, SlidingWindowKVCache, QuantKVCache, TieredKVCache
 except ImportError:
-    from kv_cache import KVCache, SlidingWindowKVCache
+    from kv_cache import KVCache, SlidingWindowKVCache, QuantKVCache, TieredKVCache  # type: ignore[assignment]
+
+# ── Eviction ────────────────────────────────────────────────────────────────
+try:
+    from .eviction import SnapKVConfig, snapkv_evict
+except ImportError:
+    from eviction import SnapKVConfig, snapkv_evict  # type: ignore[import]
+
+# ── Compaction ──────────────────────────────────────────────────────────────
+try:
+    from .compaction import OMPCompactionConfig, omp_compact
+except ImportError:
+    from compaction import OMPCompactionConfig, omp_compact  # type: ignore[import]
+
+# ── Stability ────────────────────────────────────────────────────────────────
+try:
+    from .stability import (
+        StabilityConfig,
+        DriftDetector,
+        AdaptiveTemperatureScheduler,
+        KVCacheIntegrityChecker,
+    )
+except ImportError:
+    from stability import (  # type: ignore[import]
+        StabilityConfig,
+        DriftDetector,
+        AdaptiveTemperatureScheduler,
+        KVCacheIntegrityChecker,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

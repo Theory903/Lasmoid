@@ -6,7 +6,10 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from ..kernel import act_quant, fp4_act_quant, fp8_gemm, fp4_gemm, weight_dequant
+try:
+    from ..kernel import act_quant, fp4_act_quant, fp8_gemm, fp4_gemm, weight_dequant
+except ImportError:
+    from kernel import act_quant, fp4_act_quant, fp8_gemm, fp4_gemm, weight_dequant
 
 __all__ = [
     "KernelProvider",
@@ -110,7 +113,7 @@ class FP4KernelProvider(KernelProvider):
 
 
 class NVFP4KernelProvider(KernelProvider):
-    """NVFP4 stub — E2M1 format planned for Phase 2."""
+    """NVFP4 — fp4_act_quant + fp4_gemm (E2M1 simulated format)."""
 
     def matmul(
         self,
@@ -119,15 +122,18 @@ class NVFP4KernelProvider(KernelProvider):
         bias: Optional[torch.Tensor] = None,
         scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        raise NotImplementedError("NVFP4 matmul — E2M1 format planned for Phase 2")
+        xq, xs = self.quantize(x)
+        s = scale if scale is not None else getattr(weight, "scale", None)
+        out = fp4_gemm(xq, xs, weight, s)
+        return out + bias if bias is not None else out
 
     def quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError("NVFP4 quantize — E2M1 format planned for Phase 2")
+        return fp4_act_quant(x.contiguous(), block_size=32)
 
     def dequantize(
-        self, x: torch.Tensor, scale: torch.Tensor, block_size: int = 128
+        self, x: torch.Tensor, scale: torch.Tensor, block_size: int = 32
     ) -> torch.Tensor:
-        raise NotImplementedError("NVFP4 dequantize — E2M1 format planned for Phase 2")
+        return weight_dequant(x.float(), scale, block_size)
 
 
 _PROVIDER_MAP: dict[str, type[KernelProvider]] = {

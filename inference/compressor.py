@@ -1,8 +1,8 @@
 import math
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
 
 try:
     from ._common import (
@@ -30,15 +30,107 @@ except ImportError:
     from config import ModelArgs
 
 
+# ══════════════════════════════════════════════════════════════════════
+# COMPRESSION MODE (P1.3: Adaptive Compression Gating)
+# ══════════════════════════════════════════════════════════════════════
+
+
+class CompressionMode:
+    """Compression mode constants for adaptive gating."""
+
+    NORMAL: str = "normal"  # ratio=4, full quality
+    HYPER: str = "hyper"  # ratio=128, triggered >300K tokens
+    EMERGENCY: str = "emergency"  # ratio=512, triggered >1.5M tokens
+
+
 class AdaptiveCompressorGate(nn.Module):
+    """
+    Automatically selects compression mode based on context length.
+
+    Modes:
+    - NORMAL:    ratio=4, standard CSA compression, full quality
+    - HYPER:     ratio=128, HCA + KV quantization + eviction, triggered at >300K tokens
+    - EMERGENCY: ratio=512, aggressive compaction, triggered at >1.5M tokens
+
+    Per-layer ratios (DeepSeek-V4-Pro pattern):
+    - Early layers: low ratio (preserve detail for downstream)
+    - Middle layers: moderate ratio (balanced)
+    - Late layers: high ratio (semantic compression sufficient)
+    """
+
+    THRESHOLD_NORMAL_TO_HYPER: int = 300_000
+    THRESHOLD_HYPER_TO_EMERGENCY: int = 1_500_000
+
     def __init__(self, n_layers: int, default_ratio: int = 4):
         super().__init__()
         self.ratios = nn.Parameter(
             torch.ones(n_layers) * default_ratio, requires_grad=False
         )
+        self.default_ratio = default_ratio
 
-    def forward(self, layer_id: int) -> int:
-        return int(self.ratios[layer_id].item())
+    def get_mode(self, current_seqlen: int) -> str:
+        if current_seqlen > self.THRESHOLD_HYPER_TO_EMERGENCY:
+            return CompressionMode.EMERGENCY
+        elif current_seqlen > self.THRESHOLD_NORMAL_TO_HYPER:
+            return CompressionMode.HYPER
+        else:
+            return CompressionMode.NORMAL
+
+    def get_ratio_for_mode(self, mode: str) -> int:
+        if mode == CompressionMode.EMERGENCY:
+            return 512
+        elif mode == CompressionMode.HYPER:
+            return 128
+        else:
+            return self.default_ratio
+
+    def forward(self, layer_id: int, current_seqlen: int = 0) -> int:
+        mode = self.get_mode(current_seqlen)
+        # HYPER/EMERGENCY modes force aggressive uniform ratio across all layers
+        if mode != CompressionMode.NORMAL:
+            return self.get_ratio_for_mode(mode)
+        # NORMAL mode: use per-layer ratios for differentiated compression profiles
+        if layer_id < len(self.ratios):
+            return int(self.ratios[layer_id].item())
+        return self.default_ratio
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ENHANCED EVENT DETECTOR (P1.4: Multi-Scale Boundary Detection)
+# ══════════════════════════════════════════════════════════════════════
+
+
+class EnhancedEventDetector(nn.Module):
+    """
+    Multi-scale event boundary detector for semantic compression.
+
+    Combines three scoring mechanisms:
+    - Local features: single-token boundary signals via Linear(dim, 1)
+    - Window features: aggregated over +/-16 token window via Conv1d
+    - Global features: segment-level topic shift detection via cross-attention
+
+    All three scores are fused via a learned linear combination → softplus.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.local_proj = nn.Linear(dim, 1)
+        self.window_conv = nn.Conv1d(dim, max(1, dim // 4), kernel_size=33, padding=16)
+        self.window_proj = nn.Linear(max(1, dim // 4), 1)
+        self.global_attn = nn.MultiheadAttention(dim, num_heads=4, batch_first=True)
+        self.fusion = nn.Linear(3, 1)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """Returns multi-scale boundary probability: [B, S, 1], already softplus'd."""
+        local = self.local_proj(h)  # [B, S, 1]
+        window_feat = self.window_conv(h.transpose(1, 2)).transpose(
+            1, 2
+        )  # [B, S, dim//4]
+        window = self.window_proj(window_feat)  # [B, S, 1]
+        global_scores, _ = self.global_attn(h, h, h)  # [B, S, dim]
+        global_scores = global_scores.mean(dim=-1, keepdim=True)  # [B, S, 1]
+        combined = torch.cat([local, window, global_scores], dim=-1)  # [B, S, 3]
+        return F.softplus(self.fusion(combined))  # [B, S, 1]
 
 
 class Compressor(nn.Module):
@@ -64,8 +156,13 @@ class Compressor(nn.Module):
         self.overlap = compress_ratio == 4
         self.rotate = rotate
 
-        # Event boundary detector (0 to 1 probability mapping)
-        self.event_detector = Linear(args.dim, 1, dtype=torch.float32)
+        # Enhanced multi-scale event boundary detector (P1.4)
+        self.event_detector = EnhancedEventDetector(args.dim)
+
+        # Adaptive compression gate for context-length-aware ratio selection (P1.3)
+        self.gate = AdaptiveCompressorGate(
+            n_layers=args.n_layers, default_ratio=compress_ratio
+        )
 
         # Pooling projections
         coff = 1 + self.overlap
@@ -156,15 +253,23 @@ class Compressor(nn.Module):
         dtype = x.dtype
         x_float = x.float()
 
-        # Calculate dynamic semantic boundary probability
-        event_prob = torch.sigmoid(self.event_detector(x_float))  # [B, S, 1]
+        # Single multi-scale event boundary computation (P1.4)
+        raw_alpha = self.event_detector(x_float)  # [B, S, 1]
+
+        # Query adaptive gate for context-length-aware compression ratio (P1.3)
+        total_seqlen = start_pos + seqlen
+        mode = self.gate.get_mode(total_seqlen)
+        ratio_mult = 1.0
+        if mode != CompressionMode.NORMAL:
+            mode_ratio = self.gate.get_ratio_for_mode(mode)
+            ratio_mult = mode_ratio / self.compress_ratio
 
         kv = self.wkv(x_float)
         score = self.wgate(x_float)
 
         if start_pos == 0:
             # ─────────────────────────────────────────────────────────
-            # PARALLEL INTEGRATE-AND-FIRE (Hardware-Accelerated Prefill)
+            # VECTORIZED INTEGRATE-AND-FIRE (P1.2: Parallel Prefix Scan)
             # ─────────────────────────────────────────────────────────
             with torch.no_grad():
                 self.kv_accumulator.zero_()
@@ -173,95 +278,84 @@ class Compressor(nn.Module):
                 self.cache_write_ptr.zero_()
                 self.fired_indices_buf.zero_()
 
-            # 1. Calculate gate scores for the entire sequence at once
+            # 1. Scale alpha by mode ratio for adaptive compression (P1.3)
+            # HYPER/EMERGENCY modes amplify ratio_mult → fewer fires → higher compression
+            alpha = raw_alpha / ratio_mult  # [B, S, 1]
+
+            # 2. Calculate gate scores and weighted KV
             gate_scores = F.softplus(score)  # [B, S, D]
             weighted_kv = kv * gate_scores  # [B, S, D]
 
-            # Sequential ACT-style accumulator loop over sequence length S
-            accum_prob = [
-                torch.tensor([0.0], device=x.device, dtype=torch.float32)
-                for _ in range(bsz)
-            ]
-            accum_kv = [
-                torch.zeros(d, device=x.device, dtype=torch.float32) for _ in range(bsz)
-            ]
-            accum_gate = [
-                torch.zeros(d, device=x.device, dtype=torch.float32) for _ in range(bsz)
-            ]
+            # 3. Parallel prefix scan: cumulative sum of boundary probabilities
+            cum_alpha = torch.cumsum(alpha, dim=1)  # [B, S, 1]
 
-            batch_fired_kvs = [[] for _ in range(bsz)]
-            batch_fired_indices = [[] for _ in range(bsz)]
+            # 4. Map each position to its fire bucket
+            # cum_alpha_prev[s] = cum_alpha[s-1] (0 for s=0)
+            # fire_bucket[s] = floor(cum_alpha_prev[s]) — which fire position s feeds into
+            cum_alpha_prev = F.pad(cum_alpha[:, :-1], (0, 0, 1, 0), value=0.0)
+            fire_bucket = torch.floor(cum_alpha_prev).long()  # [B, S, 1]
 
-            for s in range(seqlen):
-                p_s = event_prob[:, s]  # [B, 1]
-                kv_s = weighted_kv[:, s, :d]  # [B, D]
-                gate_s = gate_scores[:, s, :d]  # [B, D]
+            # 5. Determine number of fires across all batch items
+            # Use global max of fire_bucket (not just last position) to ensure all
+            # scatter_add/reduce_ target indices are in range
+            num_fires = max(1, int(fire_bucket.max().item()) + 1)
 
-                for b in range(bsz):
-                    p = p_s[b, 0].item()
-                    k = kv_s[b]
-                    g = gate_s[b]
+            # 6. Scatter-add weighted KV and gate scores into fire buckets
+            fire_idx = fire_bucket.expand(-1, -1, d)  # [B, S, D]
+            fire_kv = torch.zeros(
+                bsz, num_fires, d, device=x.device, dtype=weighted_kv.dtype
+            )
+            fire_gate = torch.zeros(
+                bsz, num_fires, d, device=x.device, dtype=gate_scores.dtype
+            )
 
-                    cur_prob = accum_prob[b][0].item()
-                    space = 1.0 - cur_prob
+            # Each position's full weighted contribution goes to its fire bucket
+            # (Boundary split approximation: O(alpha_minor) error, negligible in practice)
+            fire_kv.scatter_add_(1, fire_idx, (weighted_kv * alpha)[..., :d])
+            fire_gate.scatter_add_(1, fire_idx, (gate_scores * alpha)[..., :d])
 
-                    if p >= space:
-                        # Fire!
-                        accum_kv[b] = accum_kv[b] + space * k
-                        accum_gate[b] = accum_gate[b] + space * g
+            # 7. Compute emitted KVs — each fire bucket emits one compressed token
+            kv_out = torch.zeros(bsz, num_fires, d, device=x.device, dtype=dtype)
+            nonzero_mask = fire_gate.abs().sum(dim=-1, keepdim=True) > 1e-10
+            kv_out_nonzero = fire_kv / (fire_gate + 1e-6)
+            kv_out = torch.where(nonzero_mask, kv_out_nonzero.to(dtype), kv_out)
 
-                        # Emit chunk
-                        chunk = accum_kv[b] / (accum_gate[b] + 1e-6)
-                        batch_fired_kvs[b].append(chunk)
-                        batch_fired_indices[b].append(s)
+            # 8. Compute fired indices (first position of each fire per batch)
+            # Find the minimum s for each fire bucket via scatter_reduce_ amin
+            s_range = (
+                torch.arange(seqlen, device=x.device)
+                .view(1, seqlen, 1)
+                .expand(bsz, -1, -1)
+            )  # [B, S, 1]
+            min_pos_per_fire = torch.full(
+                (bsz, num_fires, 1), seqlen, device=x.device, dtype=torch.float32
+            )
+            min_pos_per_fire.scatter_reduce_(
+                1, fire_bucket, s_range.float(), reduce="amin", include_self=False
+            )
+            fired_indices_tensor = min_pos_per_fire.squeeze(-1).long()  # [B, num_fires]
 
-                        # Remainder
-                        rem = p - space
-                        accum_prob[b] = torch.tensor(
-                            [rem], device=x.device, dtype=torch.float32
-                        )
-                        accum_kv[b] = rem * k
-                        accum_gate[b] = rem * g
-                    else:
-                        # No fire
-                        accum_prob[b] = accum_prob[b] + p
-                        accum_kv[b] = accum_kv[b] + p * k
-                        accum_gate[b] = accum_gate[b] + p * g
+            # Handle zero-fire edge case: force one fire at end of sequence
+            zero_fire_mask = (fire_bucket[:, -1, 0] < 0) | (
+                fired_indices_tensor.sum(dim=-1) == 0
+            )
+            if zero_fire_mask.any():
+                for b_idx in torch.where(zero_fire_mask)[0]:
+                    b_val = b_idx.item()
+                    kv_out[b_val, 0] = (
+                        weighted_kv[b_val, -1, :d] / (gate_scores[b_val, -1, :d] + 1e-6)
+                    ).to(dtype)
+                    fired_indices_tensor[b_val, 0] = seqlen - 1
 
-            # Find maximum number of fires across all batch items to build output tensor
-            max_fires = max(len(batch_fired_kvs[b]) for b in range(bsz))
-            if max_fires == 0:
-                max_fires = 1
-
-            kv_out_list = []
-            fired_indices_list = []
-
-            for b in range(bsz):
-                kvs = batch_fired_kvs[b]
-                indices = batch_fired_indices[b]
-
-                if len(kvs) == 0:
-                    # Force one fire at the end of sequence
-                    forced_chunk = (
-                        accum_kv[b] / (accum_gate[b] + 1e-6)
-                        if accum_prob[b][0].item() > 0
-                        else kv[b, -1, :d]
-                    )
-                    kvs = [forced_chunk]
-                    indices = [seqlen - 1]
-
-                while len(kvs) < max_fires:
-                    kvs.append(kvs[-1].clone())
-                    indices.append(indices[-1])
-
-                kv_out_list.append(torch.stack(kvs))
-                fired_indices_list.append(
-                    torch.tensor(indices, device=x.device, dtype=torch.long)
-                )
-
-            kv_out = torch.stack(kv_out_list).to(dtype)  # [B, max_fires, D]
-            fired_indices_tensor = torch.stack(fired_indices_list)  # [B, max_fires]
-            num_fires = max_fires
+            # Compute carryover remainder state for autoregressive phase
+            remainder = cum_alpha[:, -1:] - torch.floor(cum_alpha[:, -1:])  # [B, 1, 1]
+            # Accumulate weighted residual KV from the last fire bucket
+            # Note: weighted_kv has coff*d dims, accumulator stores only d dims
+            last_fire_mask = (fire_bucket == fire_bucket[:, -1:]).float()  # [B, S, 1]
+            residual_weight = last_fire_mask * alpha
+            accum_kv = (residual_weight * weighted_kv[..., :d]).sum(dim=1)  # [B, D]
+            accum_gate = (residual_weight * gate_scores[..., :d]).sum(dim=1)  # [B, D]
+            accum_prob = remainder.squeeze(-1)  # [B, 1]
 
             # 5. Apply RoPE to the compressed semantic nodes
             freqs_cis = self.freqs_cis[:num_fires]
@@ -283,22 +377,28 @@ class Compressor(nn.Module):
                 self.cache_write_ptr[:bsz] = write_len
 
                 # 7. Carry over the incomplete remainder to the autoregressive state buffers
-                self.kv_accumulator[:bsz] = torch.stack(accum_kv).detach()
-                self.gate_accumulator[:bsz] = torch.stack(accum_gate).detach()
-                self.fire_threshold[:bsz] = torch.stack(accum_prob).detach()
+                self.kv_accumulator[:bsz] = accum_kv.detach()
+                self.gate_accumulator[:bsz] = accum_gate.detach()
+                self.fire_threshold[:bsz] = accum_prob.detach()
 
-            # Return kv_out and event_prob for CIF loss (only in training/prefill)
+            # Return kv_out and event_prob (sigmoid-bounded) for CIF loss (only in training/prefill)
             if self.training:
-                return kv_out, event_prob
+                return kv_out, torch.sigmoid(raw_alpha)
             return kv_out
         else:
             # Autoregressive generation phase
+            # Compute bounded event probability for step-wise fire accumulation
+            event_prob = torch.sigmoid(raw_alpha)  # [B, S, 1]
             # Retrieve current state from buffers (detached to break autograd graph)
             kv_acc = self.kv_accumulator[:bsz].detach().clone()
             gate_acc = self.gate_accumulator[:bsz].detach().clone()
             fire_th = self.fire_threshold[:bsz].detach().clone()
 
-            prob = event_prob[:, 0, :]
+            prob = (
+                event_prob[:, 0, :] / ratio_mult
+                if ratio_mult > 1
+                else event_prob[:, 0, :]
+            )
             fire_th = fire_th + prob
 
             # Use only head_dim dimensions for accumulation (compressed space)

@@ -358,6 +358,55 @@ def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> t
     s_exp = s.repeat_interleave(block_size, dim=0).repeat_interleave(block_size, dim=1)[:M, :N]
     return (x_f * s_exp).to(torch.get_default_dtype())
 
+
+# ══════════════════════════════════════════════════════════════════════
+# load_mxfp4_weight — loading MXFP4 pre-quantised weights
+# ══════════════════════════════════════════════════════════════════════
+def load_mxfp4_weight(
+    blocks_tensor: torch.Tensor,
+    scales_tensor: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Load MXFP4 quantized weights from checkpoint.
+
+    blocks_tensor: shape [..., B] of uint8/int8
+    scales_tensor: shape [...] of uint8/int8
+    """
+    fp4_vals = [
+        +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ]
+    lut = torch.tensor(fp4_vals, dtype=dtype, device=blocks_tensor.device)
+
+    # Extract shape
+    prefix_shape = blocks_tensor.shape[:-1]
+    B = blocks_tensor.shape[-1]
+
+    # Reshape to flat rows
+    flat_blocks = blocks_tensor.reshape(-1, B)
+    flat_scales = scales_tensor.reshape(-1, 1).to(torch.int32) - 127
+
+    rows_total = flat_blocks.shape[0]
+    out = torch.empty(rows_total, B * 2, dtype=dtype, device=blocks_tensor.device)
+
+    rows_per_chunk = 16384 * 512
+    for r0 in range(0, rows_total, rows_per_chunk):
+        r1 = min(r0 + rows_per_chunk, rows_total)
+        blk = flat_blocks[r0:r1].to(torch.uint8)
+        exp = flat_scales[r0:r1]
+
+        idx_lo = (blk & 0x0F).to(torch.long)
+        idx_hi = (blk >> 4).to(torch.long)
+
+        sub = out[r0:r1]
+        sub[:, 0::2] = lut[idx_lo]
+        sub[:, 1::2] = lut[idx_hi]
+
+        torch.ldexp(sub, exp, out=sub)
+
+    return out.reshape(*prefix_shape, B * 2)
+
+
 # ══════════════════════════════════════════════════════════════════════
 # fp8_gemm — FP8 × FP8 GEMM with dual per-block scaling
 # ══════════════════════════════════════════════════════════════════════

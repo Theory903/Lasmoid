@@ -17,6 +17,11 @@ try:
     from .moe import Gate
     from .mtp import MTPBlock
     from .config import ModelArgs
+    from .stability import (
+        DriftDetector,
+        AdaptiveTemperatureScheduler,
+        KVCacheIntegrityChecker,
+    )
 except ImportError:
     from _common import RMSNorm, Linear, set_dtype
     from attention import MLAAttention, precompute_freqs_cis
@@ -25,12 +30,26 @@ except ImportError:
     from moe import Gate
     from mtp import MTPBlock
     from config import ModelArgs
+    from stability import (
+        DriftDetector,
+        AdaptiveTemperatureScheduler,
+        KVCacheIntegrityChecker,
+    )
 
 
 class Lasmoid(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
+
+        # ══ Einsum parameterization (Gemma-4) ══
+        if getattr(args, "use_einsum", False):
+            try:
+                from ._common import set_use_einsum
+            except ImportError:
+                from _common import set_use_einsum
+
+            set_use_einsum(True)
         self.max_seq_len = args.max_seq_len
         self.hc_mult = args.num_residual_streams
         self.emb = nn.Embedding(args.vocab_size, args.dim)
@@ -78,6 +97,43 @@ class Lasmoid(nn.Module):
             self.audio_proj = Linear(args.audio_dim, args.dim, dtype=torch.bfloat16)
             self.audio_norm = RMSNorm(args.dim, args.norm_eps)
 
+        # Multimodal Encoders
+        self.vision_encoder = None
+        if getattr(args, "vision_dim", 0) > 0:
+            try:
+                from .vision import LasmoidVisionEncoder
+            except ImportError:
+                from vision import LasmoidVisionEncoder
+            self.vision_encoder = LasmoidVisionEncoder(
+                vision_dim=args.vision_dim,
+                dim=args.dim,
+                n_layers=getattr(args, "n_vision_layers", 16),
+                norm_eps=args.norm_eps,
+            )
+
+        self.audio_encoder = None
+        if getattr(args, "audio_dim", 0) > 0:
+            try:
+                from .audio import LasmoidAudioEncoder
+            except ImportError:
+                from audio import LasmoidAudioEncoder
+            self.audio_encoder = LasmoidAudioEncoder(
+                audio_feature_dim=getattr(args, "audio_feature_dim", 80),
+                conformer_dims=getattr(args, "audio_conformer_dims", 1024),
+                lm_model_dims=getattr(args, "audio_lm_dims", 1536),
+                dim=args.dim,
+                n_layers=getattr(args, "n_audio_layers", 12),
+                norm_eps=args.norm_eps,
+            )
+
+        # Per-layer modality parameters
+        per_layer_dim = getattr(args, "per_layer_input_dim", 64)
+        self.per_layer_embeddings = nn.Parameter(
+            torch.randn(3, args.n_layers, per_layer_dim, dtype=torch.bfloat16) * 0.02
+        )
+        self.per_layer_proj = Linear(args.dim, args.n_layers * per_layer_dim, dtype=torch.bfloat16)
+        self.per_layer_norm = RMSNorm(per_layer_dim, args.norm_eps)
+
         # Multi-Token Prediction (MTP)
         self.mtp = nn.ModuleList()
         for i in range(args.n_mtp_layers):
@@ -86,12 +142,13 @@ class Lasmoid(nn.Module):
             blk.head = self.head
             self.mtp.append(blk)
 
-        # YaRN RoPE cache
+        # YaRN RoPE cache (cap at 2M+1024 to prevent OOM)
+        freqs_seqlen = min(args.max_seq_len + 1024, 2097152 + 1024)
         self.register_buffer(
             "freqs_cis",
             precompute_freqs_cis(
                 args.rope_head_dim,
-                args.max_seq_len + 1024,
+                freqs_seqlen,
                 args.original_seq_len,
                 args.rope_theta,
                 args.rope_factor,
@@ -108,6 +165,75 @@ class Lasmoid(nn.Module):
         self.last_vq_loss = torch.tensor(0.0)
         self.last_moe_loss = torch.tensor(0.0)
         self.last_token_concept_loss = torch.tensor(0.0)
+
+        # Stability system (config-flag gated)
+        stab_cfg = self.args.stability_config
+        self.stability_enabled = stab_cfg.enabled
+        if self.stability_enabled:
+            self.drift_detector = DriftDetector(stab_cfg)
+            self.temp_scheduler = AdaptiveTemperatureScheduler(stab_cfg)
+            self.cache_checker = KVCacheIntegrityChecker(stab_cfg)
+
+        self.create_kv_cache_sharing_patterns()
+
+        # Check and apply post-training quantization (PTQ) to MoE experts
+        if hasattr(self.args, "quant_config") and self.args.quant_config is not None:
+            try:
+                from .moe import DeepSeekMoE
+            except ImportError:
+                from moe import DeepSeekMoE
+
+            for layer in self.layers:
+                if hasattr(layer, "moe_layer") and isinstance(layer.moe_layer, DeepSeekMoE):
+                    if self.args.quant_config.moe_route_dtype == "nvfp4":
+                        layer.moe_layer.quantize_routed_experts_to_nvfp4()
+                    elif self.args.quant_config.moe_route_dtype == "fp8":
+                        layer.moe_layer.quantize_routed_experts_to_fp8()
+
+                    if self.args.quant_config.moe_shared_dtype == "fp8":
+                        layer.moe_layer.quantize_shared_expert_to_fp8()
+
+
+    def create_kv_cache_sharing_patterns(self):
+        frac = getattr(self.args, "frac_shared_layers", 0.0)
+        if frac <= 0.0:
+            return
+
+        # Group layers by attention class type
+        by_type = {}
+        for idx, layer in enumerate(self.layers):
+            attn_type = type(layer.attn)
+            if attn_type not in by_type:
+                by_type[attn_type] = []
+            by_type[attn_type].append(idx)
+
+        for attn_type, indices in by_type.items():
+            num_layers = len(indices)
+            if num_layers <= 1:
+                continue
+            num_unshared = max(1, int(num_layers * (1.0 - frac)))
+            for i in range(num_unshared, num_layers):
+                shared_idx = indices[i]
+                target_idx = indices[i % num_unshared]
+
+                shared_attn = self.layers[shared_idx].attn
+                target_attn = self.layers[target_idx].attn
+
+                # List of potential cache buffer names
+                buffer_names = [
+                    "kv_cache",
+                    "local_k_cache",
+                    "local_v_cache",
+                    "global_k_cache",
+                    "global_v_cache",
+                    "global_write_ptr",
+                ]
+                for name in buffer_names:
+                    if hasattr(target_attn, name):
+                        target_tensor = getattr(target_attn, name)
+                        setattr(shared_attn, name, target_tensor)
+                        if name in shared_attn._buffers:
+                            shared_attn._buffers[name] = target_tensor
 
     def embed_tokens(
         self,
@@ -141,6 +267,62 @@ class Lasmoid(nn.Module):
             ext = self.external_embedding_norm(ext)
         return token_emb + ext.to(token_emb.dtype) * self.args.external_embedding_scale
 
+    def embed_multimodal(
+        self,
+        x_dec: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        audio_values: Optional[torch.Tensor] = None,
+        external_embeddings: Optional[torch.Tensor] = None,
+        vision_output_length: int = 280,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 1. Base text/external embedding
+        fused_embeddings = self.embed_tokens(x_dec, external_embeddings).to(torch.bfloat16)
+        B, N_dec, dim = fused_embeddings.shape
+
+        modality_ids = torch.full(
+            (B, N_dec),
+            0,  # MODALITY_TEXT
+            dtype=torch.long,
+            device=x_dec.device,
+        )
+
+        # 2. Interleave vision embeddings if present
+        IMAGE_PLACEHOLDER = 258880
+        if pixel_values is not None and self.vision_encoder is not None:
+            # Shape: [B, V_len, dim], [B, V_len]
+            vision_embeddings, vision_modality_ids = self.vision_encoder(
+                pixel_values, output_length=vision_output_length
+            )
+            for b in range(B):
+                idx_v = (x_dec[b] == IMAGE_PLACEHOLDER).nonzero(as_tuple=True)[0]
+                if len(idx_v) > 0:
+                    min_len = min(len(idx_v), vision_embeddings.size(1))
+                    fused_embeddings[b, idx_v[:min_len]] = vision_embeddings[b, :min_len].to(fused_embeddings.dtype)
+                    modality_ids[b, idx_v[:min_len]] = 1  # MODALITY_VISION
+
+        # 3. Interleave audio embeddings if present
+        AUDIO_PLACEHOLDER = 258881
+        if audio_values is not None and self.audio_encoder is not None:
+            # Shape: [B, A_len, dim], [B, A_len]
+            audio_embeddings, audio_modality_ids = self.audio_encoder(audio_values)
+            for b in range(B):
+                idx_a = (x_dec[b] == AUDIO_PLACEHOLDER).nonzero(as_tuple=True)[0]
+                if len(idx_a) > 0:
+                    min_len = min(len(idx_a), audio_embeddings.size(1))
+                    fused_embeddings[b, idx_a[:min_len]] = audio_embeddings[b, :min_len].to(fused_embeddings.dtype)
+                    modality_ids[b, idx_a[:min_len]] = 2  # MODALITY_AUDIO
+
+        # 4. Compute per-layer modality features
+        layer_proj_out = self.per_layer_proj(fused_embeddings)  # [B, N_dec, n_layers * per_layer_input_dim]
+        layer_proj_out = layer_proj_out.view(B, N_dec, self.args.n_layers, -1)
+
+        mod_embeddings = self.per_layer_embeddings[modality_ids]  # [B, N_dec, n_layers, per_layer_input_dim]
+
+        layer_feats = layer_proj_out + mod_embeddings
+        layer_feats = self.per_layer_norm(layer_feats)
+
+        return fused_embeddings, layer_feats
+
     def apply_pending_bias_updates(self):
         for m in self.modules():
             if isinstance(m, Gate):
@@ -169,6 +351,9 @@ class Lasmoid(nn.Module):
         start_pos: int = 0,
         cu_seqlens: Optional[torch.Tensor] = None,
         steering_vector: Optional[Any] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        audio_values: Optional[torch.Tensor] = None,
+        vision_output_length: int = 280,
     ) -> Tuple[
         torch.Tensor,
         Optional[torch.Tensor],
@@ -190,7 +375,13 @@ class Lasmoid(nn.Module):
             assert x_enc is not None, "x_enc must be provided at start_pos == 0"
             _, N_enc = x_enc.shape
             freqs_cis_enc = self.freqs_cis[:N_enc]
-            H_enc = self.embed_tokens(x_enc, external_embeddings).to(torch.bfloat16)
+            H_enc, _ = self.embed_multimodal(
+                x_enc,
+                pixel_values=pixel_values,
+                audio_values=audio_values,
+                external_embeddings=external_embeddings,
+                vision_output_length=vision_output_length,
+            )
             enc_out = self.encoder_attn(
                 self.encoder_norm(H_enc), freqs_cis_enc, start_pos=0
             )
@@ -204,7 +395,13 @@ class Lasmoid(nn.Module):
         H_dec_external = external_embeddings
         if external_embeddings is not None and external_embeddings.shape[1] != N_dec:
             H_dec_external = external_embeddings[:, -N_dec:, :]
-        H_dec = self.embed_tokens(x_dec, H_dec_external).to(torch.bfloat16)
+        H_dec, layer_feats = self.embed_multimodal(
+            x_dec,
+            pixel_values=pixel_values,
+            audio_values=audio_values,
+            external_embeddings=H_dec_external,
+            vision_output_length=vision_output_length,
+        )
 
         # Parallel streams routing concept embedding representations
         H_memory = torch.mean(memory_state, dim=1, keepdim=True).expand(-1, N_dec, -1)
@@ -229,6 +426,7 @@ class Lasmoid(nn.Module):
 
         for r_step in range(reasoning_steps):
             for layer in self.layers:
+                layer_feats_slice = layer_feats[:, :, layer.layer_id, :]
                 if self.gradient_checkpointing and self.training:
 
                     def create_custom_forward(module):
@@ -244,12 +442,17 @@ class Lasmoid(nn.Module):
                             freqs_cis_dec,
                             start_pos,
                             x_dec,
+                            layer_feats_slice,
                             use_reentrant=False,
                         )
                     )
                 else:
                     streams, z_loss, vq_loss, routing, indices, adj = layer(
-                        streams, freqs_cis_dec, start_pos, x_dec
+                        streams,
+                        freqs_cis_dec,
+                        start_pos,
+                        x_dec,
+                        layer_feats=layer_feats_slice,
                     )
 
                 if r_step == reasoning_steps - 1:
@@ -318,6 +521,12 @@ class Lasmoid(nn.Module):
 
         logits = F.linear(h_normed.float(), self.head.weight.float())
 
+        # Final logit softcap (Gemma-4 style: tanh(logits / softcap) * softcap)
+        # Prevents logit explosion during long generation; config-flag-gated.
+        final_softcap = self.args.final_logit_softcap
+        if final_softcap is not None:
+            logits = torch.tanh(logits / final_softcap) * final_softcap
+
         # 3. Multi-Token Prediction (t+2 prediction)
         mtp_logits = None
         if self.training and N_dec > 1 and len(self.mtp) > 0:
@@ -351,6 +560,9 @@ class Lasmoid(nn.Module):
         pad_token: int = 1,
         max_len: Optional[int] = None,
         steering_vector: Optional[Any] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        audio_values: Optional[torch.Tensor] = None,
+        vision_output_length: int = 280,
         **kwargs,
     ) -> torch.Tensor:
         self.eval()
@@ -371,19 +583,32 @@ class Lasmoid(nn.Module):
 
         # Single Read pass to freeze prompt representations
         logits, _, concept_db, memory_state, *_ = self(
-            idx_padded, idx_padded, start_pos=0, steering_vector=steering_vector
+            idx_padded,
+            idx_padded,
+            start_pos=0,
+            steering_vector=steering_vector,
+            pixel_values=pixel_values,
+            audio_values=audio_values,
+            vision_output_length=vision_output_length,
         )
 
         # Autoregressive decode sampling
         last_logits = logits[:, -1, :]
 
-        # Frontier Self-Evolution: adjust temperature based on symbolic guard confidence
-        if hasattr(self, "last_confidences") and self.last_confidences:
-            mean_conf = (
-                torch.stack([c.mean() for c in self.last_confidences]).mean().item()
+        # Stability system: drift detection + adaptive temp (config-flag gated)
+        if self.stability_enabled:
+            drift_signals = self.drift_detector.check(logits)
+            temperature = self.temp_scheduler.get_temperature(
+                actual_max_len, drift_signals
             )
-            # Dynamic temperature: confidence 1.0 -> temp 0.2, confidence 0.0 -> temp 1.5
-            temperature = max(0.2, min(1.5, 1.5 - mean_conf * 1.3))
+        else:
+            # Frontier Self-Evolution: adjust temperature based on symbolic guard confidence
+            if hasattr(self, "last_confidences") and self.last_confidences:
+                mean_conf = (
+                    torch.stack([c.mean() for c in self.last_confidences]).mean().item()
+                )
+                # Dynamic temperature: confidence 1.0 -> temp 0.2, confidence 0.0 -> temp 1.5
+                temperature = max(0.2, min(1.5, 1.5 - mean_conf * 1.3))
 
         if temperature > 0:
             last_logits = last_logits / temperature
@@ -409,12 +634,21 @@ class Lasmoid(nn.Module):
 
             last_logits = logits[:, -1, :]
 
-            # Recalculate dynamic temperature for current token
-            if hasattr(self, "last_confidences") and self.last_confidences:
-                mean_conf = (
-                    torch.stack([c.mean() for c in self.last_confidences]).mean().item()
+            # Stability system: drift + adaptive temp (config-flag gated)
+            if self.stability_enabled:
+                drift_signals = self.drift_detector.check(logits)
+                temperature = self.temp_scheduler.get_temperature(
+                    current_pos + 1, drift_signals
                 )
-                temperature = max(0.2, min(1.5, 1.5 - mean_conf * 1.3))
+            else:
+                # Recalculate dynamic temperature for current token
+                if hasattr(self, "last_confidences") and self.last_confidences:
+                    mean_conf = (
+                        torch.stack([c.mean() for c in self.last_confidences])
+                        .mean()
+                        .item()
+                    )
+                    temperature = max(0.2, min(1.5, 1.5 - mean_conf * 1.3))
 
             if temperature > 0:
                 last_logits = last_logits / temperature

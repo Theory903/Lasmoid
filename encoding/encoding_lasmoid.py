@@ -1000,3 +1000,17 @@ def parse_message_from_completion_text(text: str, thinking_mode: str) -> Dict[st
         res_dict["self_review"] = parse_key_value_pairs(sr_content, ":")
 
     return res_dict
+
+
+def expand_multimodal_placeholders(
+    prompt: str,
+    vision_budget: int = 280,
+    audio_budget: int = 120,
+) -> str:
+    """
+    Expands '<｜image｜>' and '<｜audio｜>' placeholders by repeating them
+    according to the budget lengths.
+    """
+    prompt = prompt.replace("<｜image｜>", "<｜image｜>" * vision_budget)
+    prompt = prompt.replace("<｜audio｜>", "<｜audio｜>" * audio_budget)
+    return prompt

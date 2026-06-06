@@ -153,6 +153,25 @@ class RoPEConfig:
 
 
 @dataclass
+class StabilityConfig:
+    """Stability system: drift detection, adaptive temp, KV cache integrity checks."""
+
+    enabled: bool = False
+    drift_window_size: int = 100
+    drift_check_interval: int = 1
+    entropy_collapse_threshold: float = 3.0
+    logit_norm_spike_threshold: float = 3.0
+    base_temperature: float = 0.7
+    min_temperature: float = 0.1
+    max_temperature: float = 2.0
+    kmin_cache_check_interval: int = 64
+    long_context_threshold_1: int = 500_000
+    long_context_threshold_2: int = 1_000_000
+    long_gen_decay_1: int = 5000
+    long_gen_decay_2: int = 10000
+
+
+@dataclass
 class RegularizationConfig:
     """Loss coefficients and regularization."""
 
@@ -166,12 +185,20 @@ class RegularizationConfig:
     post_ffw_norm: bool = True
 
 
-# ══════════════════════════════════════════════════════════════════════
-# BACKWARD-COMPATIBLE ModelArgs  (wraps all sub-configs)
-# ══════════════════════════════════════════════════════════════════════
+@dataclass
+class QuantConfig:
+    """Precision mapping configuration for post-training quantization."""
+
+    moe_route_dtype: Literal["bf16", "fp8", "nvfp4"] = "bf16"
+    moe_shared_dtype: Literal["bf16", "fp8"] = "bf16"
+    attn_proj_dtype: Literal["bf16", "fp8"] = "bf16"
+    kv_cache_dtype: Literal["bf16", "fp8"] = "bf16"
+    embed_dtype: Literal["bf16"] = "bf16"
+    calib_size: int = 2000
 
 
 @dataclass
+
 class ModelArgs:
     """Monolithic config for backward compatibility — delegates to sub-configs."""
 
@@ -195,8 +222,18 @@ class ModelArgs:
     o_groups: int = 2
     o_lora_rank: int = 256
     attn_logits_soft_cap: Optional[float] = 30.0
+    final_logit_softcap: Optional[float] = 30.0
     sliding_window_size: int = 512
     window_size: int = 512  # alias for sliding_window_size
+
+    # ── Gemma-4 Hybrid Attention ──
+    attention_type: Literal["local", "global", "hybrid"] = "local"
+    global_heads: int = 4
+    global_key_size: int = 512
+    k_eq_v_global: bool = False
+    qk_norm_with_scale: bool = True
+    local_base_frequency: int = 10_000
+    global_base_frequency: int = 1_000_000
 
     # ── Indexer ──
     index_n_heads: int = 4
@@ -228,6 +265,11 @@ class ModelArgs:
     n_hash_layers: int = 0
     moe_dual_ffn: bool = True
     swiglu_limit: float = 10.0
+
+    # ── Quantization ──
+    quant_config: QuantConfig = field(default_factory=QuantConfig)
+    use_mxfp4_weights: bool = False
+
 
     # ── SSM ──
     ssm_heads: int = 8
@@ -265,6 +307,9 @@ class ModelArgs:
     # ── MTP ──
     n_mtp_layers: int = 1
 
+    # ── Einsum Parameterization (Gemma-4) ──
+    use_einsum: bool = False
+
     # ── RoPE / YaRN ──
     rope_theta: float = 10000.0
     rope_factor: float = 1.0
@@ -275,6 +320,12 @@ class ModelArgs:
     # ── Vision / Audio ──
     vision_dim: int = 0
     audio_dim: int = 0
+    n_vision_layers: int = 16
+    n_audio_layers: int = 12
+    audio_conformer_dims: int = 1024
+    audio_lm_dims: int = 1536
+    audio_feature_dim: int = 80
+    per_layer_input_dim: int = 64
 
     # ── Reasoning ──
     reasoning_steps: int = 1
@@ -304,6 +355,32 @@ class ModelArgs:
 
     # ── KV Cache ──
     frac_shared_layers: float = 0.5
+    use_fp8_kv: bool = False
+    use_turboquant: bool = False
+    use_kv_eviction: bool = False
+    use_compaction: bool = False
+
+    # ── Block AttnRes ──
+    use_block_attnres: bool = False
+    block_attnres_block_size: int = 16
+    block_attnres_n_blocks: int = 4
+
+    # ── Ring Attention ──
+    use_ring_attention: bool = False
+
+    # ── Stability ──
+    stability_enabled: bool = False
+    stability_drift_window_size: int = 100
+    stability_entropy_collapse_sigma: float = 3.0
+    stability_logit_norm_spike_sigma: float = 3.0
+    stability_base_temperature: float = 0.7
+    stability_min_temperature: float = 0.1
+    stability_max_temperature: float = 2.0
+    stability_cache_check_interval: int = 64
+    stability_long_context_soft: int = 500_000
+    stability_long_context_hard: int = 1_000_000
+    stability_long_gen_soft: int = 5_000
+    stability_long_gen_hard: int = 10_000
 
     @property
     def nope_head_dim(self) -> int:
@@ -336,6 +413,13 @@ class ModelArgs:
             indexer_head_dim=self.indexer_head_dim,
             index_topk=self.index_topk,
             compress_rope_theta=self.compress_rope_theta,
+            attention_type=self.attention_type,
+            global_heads=self.global_heads,
+            global_key_size=self.global_key_size,
+            k_eq_v_global=self.k_eq_v_global,
+            qk_norm_with_scale=self.qk_norm_with_scale,
+            local_base_frequency=self.local_base_frequency,
+            global_base_frequency=self.global_base_frequency,
         )
 
     @property
@@ -388,4 +472,21 @@ class ModelArgs:
             num_residual_streams=self.num_residual_streams,
             sinkhorn_iters=self.hc_sinkhorn_iters,
             eps=self.hc_eps,
+        )
+
+    @property
+    def stability_config(self) -> StabilityConfig:
+        return StabilityConfig(
+            enabled=self.stability_enabled,
+            drift_window_size=self.stability_drift_window_size,
+            entropy_collapse_threshold=self.stability_entropy_collapse_sigma,
+            logit_norm_spike_threshold=self.stability_logit_norm_spike_sigma,
+            base_temperature=self.stability_base_temperature,
+            min_temperature=self.stability_min_temperature,
+            max_temperature=self.stability_max_temperature,
+            kmin_cache_check_interval=self.stability_cache_check_interval,
+            long_context_threshold_1=self.stability_long_context_soft,
+            long_context_threshold_2=self.stability_long_context_hard,
+            long_gen_decay_1=self.stability_long_gen_soft,
+            long_gen_decay_2=self.stability_long_gen_hard,
         )

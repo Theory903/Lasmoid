@@ -9,19 +9,21 @@ import torch.nn as nn
 from typing import Optional, Tuple
 
 try:
-    from ._common import RMSNorm
-    from .attention import CSAAttention, HCAAttention
+    from ._common import RMSNorm, Linear
+    from .attention import CSAAttention, HCAAttention, HybridSlidingGlobal
     from .mhc import ManifoldConstrainedHyperConnection
     from .moe import DeepSeekMoE
     from .ssm import StateSpaceRecurrence
     from .config import ModelArgs
+    from .attnres import BlockAttnRes
 except ImportError:
-    from _common import RMSNorm
-    from attention import CSAAttention, HCAAttention
+    from _common import RMSNorm, Linear
+    from attention import CSAAttention, HCAAttention, HybridSlidingGlobal
     from mhc import ManifoldConstrainedHyperConnection
     from moe import DeepSeekMoE
     from ssm import StateSpaceRecurrence
     from config import ModelArgs
+    from attnres import BlockAttnRes
 
 
 class LasmoidBlock(nn.Module):
@@ -30,11 +32,14 @@ class LasmoidBlock(nn.Module):
         self.layer_id = layer_id
         self.skip_scale = nn.Parameter(torch.ones(1))
 
-        # Interleaved Hybrid Attention
-        self.is_csa = layer_id % 2 == 0
+        # Interleaved Hybrid Attention (Gemma-4 style)
         self.attn_norm = RMSNorm(args.dim, args.norm_eps)
+        attn_type = getattr(args, "attention_type", "local")
+        is_hybrid_layer = attn_type == "hybrid" and (layer_id % 5 == 4)
 
-        if self.is_csa:
+        if is_hybrid_layer:
+            self.attn = HybridSlidingGlobal(args, layer_id)
+        elif layer_id % 2 == 0:
             self.attn = CSAAttention(args)  # uses m compression
         else:
             self.attn = HCAAttention(args)  # uses m' compression
@@ -65,12 +70,26 @@ class LasmoidBlock(nn.Module):
         if self.use_post_ffw_norm:
             self.post_ffw_norm = RMSNorm(args.dim, args.norm_eps)
 
+        # Block AttnRes (gated)
+        self.use_block_attnres = getattr(args, "use_block_attnres", False)
+        if self.use_block_attnres:
+            self.block_attnres = BlockAttnRes(
+                args.dim,
+                block_size=getattr(args, "block_attnres_block_size", 16),
+                n_blocks=getattr(args, "block_attnres_n_blocks", 4),
+            )
+
+        # Per-layer modality feature projection
+        per_layer_dim = getattr(args, "per_layer_input_dim", 64)
+        self.layer_feats_proj = Linear(per_layer_dim, args.dim, dtype=torch.bfloat16)
+
     def forward(
         self,
         streams: torch.Tensor,
         freqs_cis: torch.Tensor,
         start_pos: int = 0,
         input_ids: Optional[torch.Tensor] = None,
+        layer_feats: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -79,6 +98,11 @@ class LasmoidBlock(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
+        if layer_feats is not None:
+            proj_feats = self.layer_feats_proj(layer_feats.to(streams.dtype))
+            # Inject modality features into the primary stream (stream 0)
+            streams = streams.clone()
+            streams[:, :, 0] = streams[:, :, 0] + proj_feats
         # 1. mHC Pre-Attention
         A_l_attn, B_l_attn, C_l_attn = self.mhc_attn(streams)
         attn_in = A_l_attn * streams
@@ -121,6 +145,9 @@ class LasmoidBlock(nn.Module):
 
         # 6. mHC Post-FFN
         streams = B_l_ffn @ streams + C_l_ffn * ffn_out
+
+        if self.use_block_attnres:
+            streams = self.block_attnres(streams)
 
         streams = streams * self.skip_scale
 

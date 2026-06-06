@@ -1,0 +1,29 @@
+{
+    "gpu_info": {
+        "cuda_available": false,
+        "device_name": "CPU Fallback",
+        "cuda_capability": [
+            0,
+            0
+        ],
+        "has_triton": false,
+        "fp8_native": false
+    },
+    "triton": {
+        "compiled": false,
+        "error": "Triton not active"
+    },
+    "vram": {},
+    "quantization": {
+        "mean_error": 0.091796875,
+        "max_error": 0.5,
+        "passed": true
+    },
+    "stability": {
+        "drift_signals": [
+            "entropy_collapse"
+        ],
+        "adjusted_temperature": 0.8999999999999999,
+        "passed": true
+    }
+}
