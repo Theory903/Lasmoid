@@ -15,7 +15,7 @@
     },
     "vram": {},
     "quantization": {
-        "mean_error": 0.091796875,
+        "mean_error": 0.08935546875,
         "max_error": 0.5,
         "passed": true
     },
@@ -24,6 +24,7 @@
             "entropy_collapse"
         ],
         "adjusted_temperature": 0.8999999999999999,
+        "recovery_passed": true,
         "passed": true
     }
 }

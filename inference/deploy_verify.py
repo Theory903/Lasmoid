@@ -137,6 +137,7 @@ def verify_quantization_roundtrip(device: str) -> dict:
 def verify_stability_softcap(device: str) -> dict:
     print("=== G5: Stability softcap & Integrity Checks ===")
     from stability import DriftDetector, AdaptiveTemperatureScheduler, DriftSignal
+    from recovery import LongRunningRecovery, ErrorLevel, RecoveryAction
     
     cfg = StabilityConfig(
         drift_window_size=5,
@@ -159,12 +160,63 @@ def verify_stability_softcap(device: str) -> dict:
     
     print(f"  Spike Event Drift Signals: {drift_signals}")
     print(f"  Temperature Scheduled: {new_temp:.2f} (Base: 0.70)")
-    passed = DriftSignal.ENTROPY_COLLAPSE in drift_signals and new_temp > 0.70
+    drift_passed = DriftSignal.ENTROPY_COLLAPSE in drift_signals and new_temp > 0.70
+    
+    # Test Recovery system state-machine
+    class MockAttn:
+        def __init__(self):
+            self._buffers = {"cache": torch.zeros(1, 10)}
+            self.global_write_ptr = 5
+        def reset_cache(self):
+            self._buffers["cache"].zero_()
+            self.global_write_ptr = 0
+
+    class MockLayer:
+        def __init__(self):
+            self.attn = MockAttn()
+
+    class MockModel:
+        def __init__(self):
+            self.layers = [MockLayer()]
+            
+    mock_model = MockModel()
+    recovery_sys = LongRunningRecovery(mock_model)
+    
+    # Save checkpoint
+    tokens = torch.tensor([1, 2, 3])
+    recovery_sys.checkpoint_manager.save_checkpoint(
+        step=5,
+        idx=tokens,
+        concept_db=None,
+        memory_state=None
+    )
+    
+    # Modify state to simulate corruption
+    mock_model.layers[0].attn._buffers["cache"][0, 0] = 9.9
+    
+    # Trigger recovery on L1 error (cache corruption)
+    action, next_temp, rollback_step = recovery_sys.recover(
+        error_level=ErrorLevel.L1,
+        step=6,
+        current_temp=0.7
+    )
+    
+    # Confirm rollback restored original state
+    state_restored = mock_model.layers[0].attn._buffers["cache"][0, 0].item() == 0.0
+    recovery_passed = (
+        action == RecoveryAction.CONTINUE and
+        rollback_step == 5 and
+        state_restored
+    )
+    print(f"  Recovery System Gate Passed: {recovery_passed}")
+    
+    passed = drift_passed and recovery_passed
     print(f"  Stability Gating Passed: {passed}\n")
     
     return {
         "drift_signals": [s.value for s in drift_signals],
         "adjusted_temperature": new_temp,
+        "recovery_passed": recovery_passed,
         "passed": passed
     }
 
