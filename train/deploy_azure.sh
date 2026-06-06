@@ -10,9 +10,10 @@
 RG_NAME="lasmoid-rg"
 LOCATION="eastus"              # Region with GPU availability
 VM_NAME="lasmoid-gpu-vm"
-VM_SIZE="Standard_NC6s_v3"     # 1x NVIDIA V100 GPU (16GB VRAM)
-# Alternate T4 GPU if V100 is unavailable:
-# VM_SIZE="Standard_NC4as_T4_v3"
+VM_SIZE="Standard_NC24ads_A100_v4" # 1x NVIDIA A100 GPU (80GB VRAM - Best performance/value at $3.67/hr)
+# Alternate V100 or T4 GPUs if A100 is unavailable:
+# VM_SIZE="Standard_NC6s_v3"       # 1x NVIDIA V100 GPU (16GB VRAM at $3.06/hr)
+# VM_SIZE="Standard_NC4as_T4_v3"   # 1x NVIDIA T4 GPU (16GB VRAM at $0.53/hr)
 
 # Deep Learning VM Image with CUDA, PyTorch, and NVIDIA Drivers pre-configured
 IMAGE="microsoft-dsvm:ubuntu-2004:pytorch-latest:latest"
