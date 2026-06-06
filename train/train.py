@@ -178,6 +178,11 @@ def train():
     parser.add_argument("--clip_eps", type=float, default=0.2, help="GRPO PPO clipping parameter")
     parser.add_argument("--kl_coeff", type=float, default=0.01, help="GRPO KL regularisation coefficient")
     parser.add_argument("--device", type=str, default=None, help="Force device (e.g. cpu, mps, cuda)")
+    # Binary dataset options
+    parser.add_argument("--train_bin", type=str, default=None, help="Path to pre-tokenized train.bin")
+    parser.add_argument("--val_bin", type=str, default=None, help="Path to pre-tokenized val.bin")
+    parser.add_argument("--train_meta", type=str, default=None, help="Path to metadata json for train split")
+    parser.add_argument("--val_meta", type=str, default=None, help="Path to metadata json for val split")
     args_cli = parser.parse_args()
 
     # DDP Distributed Bootstrapping
@@ -216,31 +221,57 @@ def train():
     if master_process:
         os.makedirs(args_cli.checkpoint_dir, exist_ok=True)
 
-    # 1. Dataset Loading (look in workspace parent directories first)
-    dataset_path = "input.txt"
-    if not os.path.exists(dataset_path):
-        parent_dataset = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "input.txt")
-        if os.path.exists(parent_dataset):
-            dataset_path = parent_dataset
-        else:
-            if master_process:
-                print("Downloading Tiny Shakespeare dataset...")
-            urllib.request.urlretrieve("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt", dataset_path)
-    
-    if master_process:
-        print(f"Loading dataset from: {dataset_path}")
-    with open(dataset_path, 'r', encoding='utf-8') as f:
-        text = f.read()
-    
     # Load PreTrainedTokenizerFast
     lasmoid_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     enc = transformers.PreTrainedTokenizerFast.from_pretrained(lasmoid_dir, fix_mistral_regex=True)
     eos_token_id = enc.eos_token_id if enc.eos_token_id is not None else 1
+
+    # Load Dataset
+    train_metadata = None
+    val_metadata = None
     
-    data = torch.tensor(enc.encode(text), dtype=torch.long)
-    n = int(0.9 * len(data))
-    train_data = data[:n]
-    val_data = data[n:]
+    if args_cli.train_bin is not None:
+        if master_process:
+            print(f"Loading binary train dataset from: {args_cli.train_bin}")
+        import numpy as np
+        train_tokens = np.fromfile(args_cli.train_bin, dtype=np.uint32)
+        train_data = torch.from_numpy(train_tokens.astype(np.int64))
+        
+        if args_cli.val_bin is not None:
+            if master_process:
+                print(f"Loading binary val dataset from: {args_cli.val_bin}")
+            val_tokens = np.fromfile(args_cli.val_bin, dtype=np.uint32)
+            val_data = torch.from_numpy(val_tokens.astype(np.int64))
+        else:
+            val_data = train_data
+            
+        if args_cli.train_meta and os.path.exists(args_cli.train_meta):
+            with open(args_cli.train_meta, 'r') as f:
+                train_metadata = json.load(f)
+        if args_cli.val_meta and os.path.exists(args_cli.val_meta):
+            with open(args_cli.val_meta, 'r') as f:
+                val_metadata = json.load(f)
+    else:
+        # Default fallback to Tiny Shakespeare text file
+        dataset_path = "input.txt"
+        if not os.path.exists(dataset_path):
+            parent_dataset = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "input.txt")
+            if os.path.exists(parent_dataset):
+                dataset_path = parent_dataset
+            else:
+                if master_process:
+                    print("Downloading Tiny Shakespeare dataset...")
+                urllib.request.urlretrieve("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt", dataset_path)
+        
+        if master_process:
+            print(f"Loading text dataset from: {dataset_path}")
+        with open(dataset_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        
+        data = torch.tensor(enc.encode(text), dtype=torch.long)
+        n = int(0.9 * len(data))
+        train_data = data[:n]
+        val_data = data[n:]
 
     # Load ModelArgs
     config_path = os.path.join(lasmoid_dir, "config.json")
@@ -268,29 +299,57 @@ def train():
     max_seq_len = model_args.max_seq_len
 
     def get_batch(split):
-        d = train_data if split == 'train' else val_data
-        ix = torch.randint(len(d) - max_seq_len - 1, (args_cli.batch_size,))
-        x = torch.stack([d[i:i+max_seq_len] for i in ix]).to(device)
-        y = torch.stack([d[i+1:i+max_seq_len+1] for i in ix]).to(device)
-        
-        # SFT Prompt-Response Loss Masking:
-        # Detect speakers (indicated by colons) to partition prompt vs target response
-        loss_mask = torch.ones_like(x, dtype=torch.float32)
-        for b in range(args_cli.batch_size):
-            tokens = x[b].tolist()
-            try:
-                text_seq = enc.decode(tokens)
-                if ':' in text_seq:
-                    colon_idx = text_seq.find(':')
-                    prompt_text = text_seq[:colon_idx]
-                    split_idx = len(enc.encode(prompt_text))
-                    split_idx = min(max(split_idx, 1), max_seq_len - 1)
-                    loss_mask[b, :split_idx] = 0.0
+        if args_cli.train_bin is not None:
+            d = train_data if split == 'train' else val_data
+            meta = train_metadata if split == 'train' else val_metadata
+            
+            num_seqs = len(d) // max_seq_len
+            ix = torch.randint(0, num_seqs, (args_cli.batch_size,))
+            
+            x_list, y_list, mask_list = [], [], []
+            for idx in ix.tolist():
+                seq_start = idx * max_seq_len
+                seq_tokens = d[seq_start : seq_start + max_seq_len]
+                x_list.append(seq_tokens)
+                
+                # Shift left to predict next token, padding the last one with eos
+                y_tokens = torch.cat([seq_tokens[1:], torch.tensor([eos_token_id], dtype=torch.long)])
+                y_list.append(y_tokens)
+                
+                loss_mask = torch.ones(max_seq_len, dtype=torch.float32)
+                if meta is not None and idx < len(meta):
+                    split_idx = meta[idx].get("split_idx", 0)
+                    loss_mask[:split_idx] = 0.0
                 else:
+                    loss_mask[:max_seq_len // 2] = 0.0
+                mask_list.append(loss_mask)
+                
+            x = torch.stack(x_list).to(device)
+            y = torch.stack(y_list).to(device)
+            loss_mask = torch.stack(mask_list).to(device)
+            return x, y, loss_mask
+        else:
+            d = train_data if split == 'train' else val_data
+            ix = torch.randint(len(d) - max_seq_len - 1, (args_cli.batch_size,))
+            x = torch.stack([d[i:i+max_seq_len] for i in ix]).to(device)
+            y = torch.stack([d[i+1:i+max_seq_len+1] for i in ix]).to(device)
+            
+            loss_mask = torch.ones_like(x, dtype=torch.float32)
+            for b in range(args_cli.batch_size):
+                tokens = x[b].tolist()
+                try:
+                    text_seq = enc.decode(tokens)
+                    if ':' in text_seq:
+                        colon_idx = text_seq.find(':')
+                        prompt_text = text_seq[:colon_idx]
+                        split_idx = len(enc.encode(prompt_text))
+                        split_idx = min(max(split_idx, 1), max_seq_len - 1)
+                        loss_mask[b, :split_idx] = 0.0
+                    else:
+                        loss_mask[b, :max_seq_len // 2] = 0.0
+                except:
                     loss_mask[b, :max_seq_len // 2] = 0.0
-            except:
-                loss_mask[b, :max_seq_len // 2] = 0.0
-        return x, y, loss_mask
+            return x, y, loss_mask
 
     # 2. Model Initialization
     model = Lasmoid(model_args).to(device)

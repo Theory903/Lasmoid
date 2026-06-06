@@ -38,6 +38,7 @@ checkpoints/
 *.pth
 *.bin
 input.txt
+*_meta.json
 
 # OS generated files
 .DS_Store
