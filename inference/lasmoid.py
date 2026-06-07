@@ -590,7 +590,7 @@ class Lasmoid(nn.Module):
                                 r_step,
                             ),
                             streams,
-                            use_reentrant=False,  # safe for multi-loss backward (CE+KL+VQ+CIF)
+                            use_reentrant=True,
                         )
                     )
                 else:
