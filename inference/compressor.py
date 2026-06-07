@@ -384,10 +384,20 @@ class Compressor(nn.Module):
             accum_prob = remainder  # [B, 1]
 
             # 10. Apply RoPE to the emitted compressed semantic nodes
-            freqs_cis = self.freqs_cis[:num_complete_fires]
-            kv_rope = apply_rotary_emb(kv_out[..., -rd:].contiguous(), freqs_cis)
-            kv_nope = kv_out[..., :-rd].contiguous()
-            kv_out = torch.cat([kv_nope, kv_rope], dim=-1).contiguous()
+            # Clamp to available freqs_cis length to prevent overflow when
+            # the compressor fires more events than the pre-allocated buffer.
+            max_freqs = self.freqs_cis.shape[0]
+            rope_len = min(num_complete_fires, max_freqs)
+            freqs_cis = self.freqs_cis[:rope_len]
+            kv_for_rope = kv_out[:, :rope_len]
+            kv_rope = apply_rotary_emb(kv_for_rope[..., -rd:].contiguous(), freqs_cis)
+            kv_nope = kv_for_rope[..., :-rd].contiguous()
+            kv_out_roped = torch.cat([kv_nope, kv_rope], dim=-1).contiguous()
+            # If there are excess events beyond freqs buffer, keep them without RoPE
+            if num_complete_fires > max_freqs:
+                kv_out = torch.cat([kv_out_roped, kv_out[:, max_freqs:]], dim=1)
+            else:
+                kv_out = kv_out_roped
 
             # 11. Write to cache
             cache_cap = self.kv_cache.shape[1]
