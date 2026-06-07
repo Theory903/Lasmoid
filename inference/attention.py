@@ -35,6 +35,11 @@ try:
 except ImportError:
     from _layers import QKNorm
 
+try:
+    from .debug import push_attention_debug
+except ImportError:
+    push_attention_debug = None
+
 
 # ══════════════════════════════════════════════════════════════════════
 # RELOCATED HELPERS  (moved from model.py to prevent circular imports)
@@ -152,9 +157,7 @@ def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int
                     dim=0,
                 )
             else:
-                row_j = F.pad(
-                    torch.arange(p + 1), (0, window_size - p - 1), value=-1
-                )
+                row_j = F.pad(torch.arange(p + 1), (0, window_size - p - 1), value=-1)
             rows.append(row_j)
         matrix = torch.stack(rows, dim=0)
     elif start_pos >= window_size - 1:
@@ -447,6 +450,7 @@ class CSAAttention(Attention):
 
     def __init__(self, args: ModelArgs, layer_id: int = 0):
         super().__init__(args, layer_id)
+        self.layer_id = layer_id
         self.dim = args.dim
         self.n_heads = args.n_heads
         self.q_lora_rank = args.q_lora_rank
@@ -483,6 +487,7 @@ class CSAAttention(Attention):
 
         if self.compress_ratio:
             self.compressor = Compressor(args, self.compress_ratio, self.head_dim)
+            self.compressor.layer_id = self.layer_id
             self.indexer = Indexer(args, self.compress_ratio)
         else:
             self.compressor = None
@@ -494,14 +499,20 @@ class CSAAttention(Attention):
             else 0
         )
         max_batch_size_comp = args.max_batch_size * args.num_residual_streams
-        use_opt = getattr(args, "use_fp8_kv", False) or getattr(args, "use_turboquant", False) or getattr(args, "use_kv_eviction", False) or getattr(args, "use_compaction", False) or (getattr(args, "frac_shared_layers", 0.0) > 0.0)
+        use_opt = (
+            getattr(args, "use_fp8_kv", False)
+            or getattr(args, "use_turboquant", False)
+            or getattr(args, "use_kv_eviction", False)
+            or getattr(args, "use_compaction", False)
+            or (getattr(args, "frac_shared_layers", 0.0) > 0.0)
+        )
         if use_opt:
             self.kv_cache = AdaptiveQuantizedKVCache(
                 max_batch=max_batch_size_comp,
                 max_seq=kv_cache_size,
                 head_dim=self.head_dim,
                 args=args,
-                dtype=torch.bfloat16
+                dtype=torch.bfloat16,
             )
         else:
             self.register_buffer(
@@ -528,7 +539,14 @@ class CSAAttention(Attention):
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int, r_step: int = 0, **kwargs):
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        start_pos: int,
+        r_step: int = 0,
+        **kwargs,
+    ):
         bsz, seqlen, _ = x.size()
         freqs_cis_layer = self.freqs_cis[start_pos : start_pos + seqlen]
         win = self.window_size
@@ -720,6 +738,7 @@ class HCAAttention(Attention):
 
     def __init__(self, args: ModelArgs, layer_id: int = 0):
         super().__init__(args, layer_id)
+        self.layer_id = layer_id
         self.dim = args.dim
         self.n_heads = args.n_heads
         self.q_lora_rank = args.q_lora_rank
@@ -756,6 +775,7 @@ class HCAAttention(Attention):
 
         if self.compress_ratio:
             self.compressor = Compressor(args, self.compress_ratio, self.head_dim)
+            self.compressor.layer_id = self.layer_id
             self.indexer = None  # HCA: no learned sparse indexer
         else:
             self.compressor = None
@@ -767,14 +787,20 @@ class HCAAttention(Attention):
             else 0
         )
         max_batch_size_comp = args.max_batch_size * args.num_residual_streams
-        use_opt = getattr(args, "use_fp8_kv", False) or getattr(args, "use_turboquant", False) or getattr(args, "use_kv_eviction", False) or getattr(args, "use_compaction", False) or (getattr(args, "frac_shared_layers", 0.0) > 0.0)
+        use_opt = (
+            getattr(args, "use_fp8_kv", False)
+            or getattr(args, "use_turboquant", False)
+            or getattr(args, "use_kv_eviction", False)
+            or getattr(args, "use_compaction", False)
+            or (getattr(args, "frac_shared_layers", 0.0) > 0.0)
+        )
         if use_opt:
             self.kv_cache = AdaptiveQuantizedKVCache(
                 max_batch=max_batch_size_comp,
                 max_seq=kv_cache_size,
                 head_dim=self.head_dim,
                 args=args,
-                dtype=torch.bfloat16
+                dtype=torch.bfloat16,
             )
         else:
             self.register_buffer(
@@ -801,7 +827,14 @@ class HCAAttention(Attention):
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int, r_step: int = 0, **kwargs):
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        start_pos: int,
+        r_step: int = 0,
+        **kwargs,
+    ):
         bsz, seqlen, _ = x.size()
         freqs_cis_layer = self.freqs_cis[start_pos : start_pos + seqlen]
         win = self.window_size
@@ -878,10 +911,15 @@ class HCAAttention(Attention):
             # HCA dynamic index path (no learned indexer)
             cache_cap = self.kv_cache.shape[1] - win
             ptr_val = self.compressor.cache_write_ptr[:bsz].max().item()
-            print(f"[Attention DEBUG] layer={getattr(self, 'layer_id', -1)}, bsz={bsz}, cache_write_ptr={self.compressor.cache_write_ptr.tolist()}, ptr_val={ptr_val}, cache_cap={cache_cap}")
-            cache_len = max(
-                1, min(ptr_val, cache_cap)
-            )
+            if push_attention_debug is not None:
+                push_attention_debug(
+                    layer_id=self.layer_id,
+                    bsz=bsz,
+                    cache_write_ptr=self.compressor.cache_write_ptr[:bsz].tolist(),
+                    ptr_val=ptr_val,
+                    cache_cap=cache_cap,
+                )
+            cache_len = max(1, min(ptr_val, cache_cap))
             if start_pos == 0:
                 fired_positions = self.compressor.fired_indices_buf[:bsz, :cache_len]
                 query_positions = torch.arange(seqlen, device=x.device).view(
@@ -1102,8 +1140,8 @@ class HybridSlidingGlobal(Attention):
                 self.local_v_cache[:B, :cutoff] = v_chunks[1]
             self._local_cache_valid_len = min(N, win)
 
-            K = self.local_k_cache[:B, :min(N, win)].unsqueeze(1)
-            V = self.local_v_cache[:B, :min(N, win)].unsqueeze(1)
+            K = self.local_k_cache[:B, : min(N, win)].unsqueeze(1)
+            V = self.local_v_cache[:B, : min(N, win)].unsqueeze(1)
             is_causal = True
             mask = None
         else:
@@ -1188,8 +1226,12 @@ class HybridSlidingGlobal(Attention):
         if start_pos > 0 and N == 1:
             # Single step decode: use only the valid portion of the global cache
             valid_global = min(ptr + 1, gcache)
-            K_cache = self.global_k_cache[:B, :valid_global].reshape(B, valid_global, Gh, Dh)
-            V_cache = self.global_v_cache[:B, :valid_global].reshape(B, valid_global, Gh, Dh)
+            K_cache = self.global_k_cache[:B, :valid_global].reshape(
+                B, valid_global, Gh, Dh
+            )
+            V_cache = self.global_v_cache[:B, :valid_global].reshape(
+                B, valid_global, Gh, Dh
+            )
             is_causal = False
             mask = None
         else:
@@ -1252,24 +1294,22 @@ class HybridSlidingGlobal(Attention):
         q = q.unflatten(-1, (self.n_heads, Dh))
         q_g = q_g.unflatten(-1, (self.global_heads, Dh))
 
-        local_freqs = self.rope_cache.get_frequencies(use_global=False)[start_pos : start_pos + N]
-        global_freqs = self.rope_cache.get_frequencies(use_global=True)[start_pos : start_pos + N]
+        local_freqs = self.rope_cache.get_frequencies(use_global=False)[
+            start_pos : start_pos + N
+        ]
+        global_freqs = self.rope_cache.get_frequencies(use_global=True)[
+            start_pos : start_pos + N
+        ]
 
         q_nope, q_rope = q[..., :nope], q[..., nope:]
-        q_rope = apply_rotary_emb(
-            q_rope.contiguous(), local_freqs
-        )
+        q_rope = apply_rotary_emb(q_rope.contiguous(), local_freqs)
         q = torch.cat([q_nope, q_rope], dim=-1)
 
         q_g_nope, q_g_rope = q_g[..., :nope], q_g[..., nope:]
-        q_g_rope = apply_rotary_emb(
-            q_g_rope.contiguous(), global_freqs
-        )
+        q_g_rope = apply_rotary_emb(q_g_rope.contiguous(), global_freqs)
         q_g = torch.cat([q_g_nope, q_g_rope], dim=-1)
 
-        k_rope = apply_rotary_emb(
-            k[..., -rd:].contiguous(), local_freqs
-        )
+        k_rope = apply_rotary_emb(k[..., -rd:].contiguous(), local_freqs)
         k = torch.cat([k[..., :-rd], k_rope], dim=-1)
         self._local_k = k
         self._local_v = v

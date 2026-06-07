@@ -535,28 +535,17 @@ cells.append(
     cell("""
 sys.path.insert(0, str(REPO_DIR / "train"))
 
-from optimizer import build_optimizers, clip_grad_global_norm, Muon
+from optimizer import build_optimizers, clip_grad_global_norm, ensure_muon_closure_compat, Muon
 from scheduler import WSDScheduler
 
-# ── Muon.step(closure) compatibility patch ──────────────────────────────────
+# ── Muon.step(closure) compatibility ────────────────────────────────────────
 # Guard against a stale remote-repo clone where Muon.step() may not accept
 # `closure=None`.  Accelerate's optimizer wrapper calls `step(closure)`, so
 # the method *must* accept it; otherwise every step raises TypeError.
 #
-# The patch is idempotent (guarded by __patched flag) and safe even if the
-# local file already has closure support — extra protection costs nothing.
-if not getattr(Muon.step, '__patched', False):
-    _orig_muon_step = Muon.step
-    @torch.no_grad()
-    def _patched_muon_step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-        return _orig_muon_step(self)
-    Muon.step = _patched_muon_step
-    Muon.step.__patched = True
-    del _orig_muon_step
+# ``ensure_muon_closure_compat`` is idempotent and safely captures the
+# original ``Muon.step`` before patching – no risk of ``NameError``.
+ensure_muon_closure_compat()
 
 # Build Muon + AdamW split (uses build_param_groups internally)
 # - Muon  → all 2D hidden weights (transformer body)

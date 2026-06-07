@@ -16,7 +16,9 @@ try:
     from .ssm import StateSpaceRecurrence
     from .config import ModelArgs
     from .attnres import BlockAttnRes
+    from .debug import BLOCK_TRACE_ENABLED as _BLOCK_TRACE
 except ImportError:
+    _BLOCK_TRACE = False
     from _common import RMSNorm, Linear
     from attention import CSAAttention, HCAAttention, HybridSlidingGlobal
     from mhc import ManifoldConstrainedHyperConnection
@@ -102,7 +104,8 @@ class LasmoidBlock(nn.Module):
         torch.Tensor,
         Optional[torch.Tensor],
     ]:
-        print(f"--- BLOCK {self.layer_id} FORWARD ---")
+        if _BLOCK_TRACE:
+            print(f"--- BLOCK {self.layer_id} FORWARD ---")
         if layer_feats is not None:
             proj_feats = self.layer_feats_proj(layer_feats.to(streams.dtype))
             # Inject modality features into the primary stream (stream 0)
@@ -144,7 +147,9 @@ class LasmoidBlock(nn.Module):
         B_f, S_f, H_f, D_f = ffn_in.shape
         ffn_in_flat = ffn_in.transpose(1, 2).reshape(B_f * H_f, S_f, D_f)
 
-        ffn_out_flat, z_loss = self.moe_layer(self.ffn_norm(ffn_in_flat), domain_steer=domain_steer, r_step=r_step)
+        ffn_out_flat, z_loss = self.moe_layer(
+            self.ffn_norm(ffn_in_flat), domain_steer=domain_steer, r_step=r_step
+        )
 
         if self.use_post_ffw_norm:
             ffn_out_flat = self.post_ffw_norm(ffn_out_flat)

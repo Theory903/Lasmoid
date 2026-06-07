@@ -24,6 +24,14 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from inference.model import Lasmoid, ModelArgs, Linear, compute_loss, compute_grpo_loss
+from inference.debug import (
+    set_debug_step,
+    reset_debug_buffer,
+    dump_compressor_summary,
+    dump_attention_summary,
+    write_debug_jsonl,
+    visualize_compression_patterns,
+)
 from optimizer import Muon, get_lr_multiplier
 from reward import reasoning_self_evolution_reward
 from grpo_stability import compute_group_advantages, safe_reward
@@ -384,6 +392,10 @@ def train():
             for g in opt_adamw.param_groups:
                 g["lr"] = args_cli.learning_rate * lr_mult
 
+            # ── Debug-visualisation hooks ──────────────────────────────────
+            set_debug_step(step)
+            reset_debug_buffer()
+
             if args_cli.rl_grpo:
                 # ─── GRPO Reinforcement Learning Step ───
                 # 1. Get batch of sequences, extract prompt sections
@@ -418,9 +430,7 @@ def train():
                 for b_g in range(args_cli.batch_size * G):
                     comp_tokens = completions[b_g].tolist()
                     text = enc.decode(comp_tokens)
-                    rewards.append(
-                        safe_reward(text, reasoning_self_evolution_reward)
-                    )
+                    rewards.append(safe_reward(text, reasoning_self_evolution_reward))
 
                 rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
 
@@ -553,21 +563,18 @@ def train():
                             event_probs,
                             loss_mask=loss_mask,
                             moe_aux_loss=raw_model.last_moe_loss,
-                            moe_aux_coeff=getattr(
-                                model_args, "moe_aux_coeff", 1.0
-                            ),
+                            moe_aux_coeff=getattr(model_args, "moe_aux_coeff", 1.0),
                             token_concept_loss=raw_model.last_token_concept_loss,
                             token_concept_coeff=getattr(
                                 model_args, "token_concept_loss_coeff", 0.05
                             ),
-                            ignore_index=getattr(
-                                model_args, "loss_ignore_index", -100
-                            ),
+                            ignore_index=getattr(model_args, "loss_ignore_index", -100),
                         )
 
                         # Next-token prediction loss for display
                         ce_loss_next = F.cross_entropy(
-                            logits.view(-1, model_args.vocab_size), yb.view(-1),
+                            logits.view(-1, model_args.vocab_size),
+                            yb.view(-1),
                             ignore_index=getattr(model_args, "loss_ignore_index", -100),
                         )
 
@@ -585,9 +592,7 @@ def train():
                         pred_coeff = getattr(
                             model_args, "predictive_coding_coeff", 0.01
                         )
-                        mtp_coeff = getattr(
-                            model_args, "mtp_loss_coeff", 0.3
-                        )
+                        mtp_coeff = getattr(model_args, "mtp_loss_coeff", 0.3)
                         loss = (
                             main_loss
                             + mtp_coeff * ce_loss_mtp
@@ -632,6 +637,10 @@ def train():
                         flush=True,
                     )
 
+                # ── Debug visualisation output ──────────────────────────
+                dump_compressor_summary()
+                dump_attention_summary()
+
             # Checkpoint Saving
             if step > 0 and step % args_cli.save_interval == 0 and master_process:
                 ckpt_path = os.path.join(
@@ -648,6 +657,9 @@ def train():
                     ckpt_path,
                 )
                 print(f"Checkpoint saved to {ckpt_path}")
+                # ── Debug persistence ────────────────────────────────
+                write_debug_jsonl()
+                visualize_compression_patterns()
     except KeyboardInterrupt:
         if master_process:
             print(

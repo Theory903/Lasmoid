@@ -35,10 +35,24 @@ class Muon(torch.optim.Optimizer):
     _NS_B = -4.7750
     _NS_C = 2.0315
 
-    def __init__(self, params, lr=0.02, momentum=0.95, ns_steps=5,
-                 adaptive_noise=False, beta2=0.99, eps=1e-8):
-        defaults = dict(lr=lr, momentum=momentum, ns_steps=ns_steps,
-                        adaptive_noise=adaptive_noise, beta2=beta2, eps=eps)
+    def __init__(
+        self,
+        params,
+        lr=0.02,
+        momentum=0.95,
+        ns_steps=5,
+        adaptive_noise=False,
+        beta2=0.99,
+        eps=1e-8,
+    ):
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            ns_steps=ns_steps,
+            adaptive_noise=adaptive_noise,
+            beta2=beta2,
+            eps=eps,
+        )
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -170,8 +184,16 @@ def build_optimizers(
     muon_p, adamw_d, adamw_n = build_param_groups(model)
     opts = []
     if muon_p:
-        opts.append(Muon(muon_p, lr=muon_lr, momentum=momentum, ns_steps=ns_steps,
-                         adaptive_noise=adaptive_noise, eps=eps))
+        opts.append(
+            Muon(
+                muon_p,
+                lr=muon_lr,
+                momentum=momentum,
+                ns_steps=ns_steps,
+                adaptive_noise=adaptive_noise,
+                eps=eps,
+            )
+        )
     adam_groups = []
     if adamw_d:
         adam_groups.append({"params": adamw_d, "weight_decay": weight_decay})
@@ -185,3 +207,52 @@ def build_optimizers(
 def clip_grad_global_norm(model, max_norm: float = 1.0) -> float:
     """Global-norm gradient clipping; returns the pre-clip total norm."""
     return float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm))
+
+
+# ══════════════════════════════════════════════════════════════════════
+# MUON.STEP CLOSURE-COMPATIBILITY PATCH  (idempotent, safe)
+# ══════════════════════════════════════════════════════════════════════
+
+_MUON_STEP_PATCHED = False
+"""Global guard — ``True`` after :func:`ensure_muon_closure_compat` has run."""
+
+
+def ensure_muon_closure_compat() -> None:
+    """Ensure :meth:`Muon.step` accepts the ``closure`` keyword argument.
+
+    The current :class:`Muon.step` implementation in this file already
+    accepts ``closure=None`` natively, so under normal circumstances this
+    function is a no-op.
+
+    It exists as a *defensive* safety net for external code (Jupyter
+    notebooks, interactive shells) that may try to monkey-patch
+    ``Muon.step`` without properly capturing the original method::
+
+        Muon.step = lambda self, closure=None: …  # WRONG – NameError!
+
+    Calling this function *before* any external patching ensures the
+    original method is captured correctly so the patch does not crash::
+
+        ensure_muon_closure_compat()
+        # Now safe to write notebooks that reference ``_orig_muon_step``
+
+    The function is idempotent – it sets a module-level ``__patched``
+    flag so subsequent calls are instant no-ops.
+    """
+    global _MUON_STEP_PATCHED
+    if _MUON_STEP_PATCHED:
+        return
+
+    _orig_muon_step = Muon.step
+
+    @torch.no_grad()
+    def _patched_step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        return _orig_muon_step(self)
+
+    Muon.step = _patched_step
+    Muon.step.__patched = True  # noqa
+    _MUON_STEP_PATCHED = True

@@ -5,6 +5,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
+    from .debug import push_compressor_debug
+except ImportError:
+    push_compressor_debug = None
+
+try:
     from ._common import (
         Linear,
         RMSNorm,
@@ -190,6 +195,9 @@ class Compressor(nn.Module):
         self.kv_cache: torch.Tensor = None  # assigned lazily from Attention.kv_cache
         self.freqs_cis: torch.Tensor = None
 
+        # Layer identity (set by parent attention module after construction)
+        self.layer_id = -1
+
         # State buffers for autoregressive integration
         max_batch_size_comp = args.max_batch_size * args.num_residual_streams
         self.register_buffer(
@@ -271,7 +279,9 @@ class Compressor(nn.Module):
         x_float = x.float()
 
         # Context-independent per-token CIF boundary score (AR == parallel)
-        cif_alpha = self.event_detector.cif_boundary_score(x_float.detach())  # [B, S, 1]
+        cif_alpha = self.event_detector.cif_boundary_score(
+            x_float.detach()
+        )  # [B, S, 1]
 
         # Full multi-scale event boundary (context-dependent, for loss only)
         raw_alpha = self.event_detector(x_float.detach())  # [B, S, 1]
@@ -323,16 +333,28 @@ class Compressor(nn.Module):
             #    (positions whose contribution pushes past an integer)
             #    The trailing partial bucket is NOT emitted; it becomes carryover.
             total_alpha_per_sample = cum_alpha[:, -1, :]  # [B, 1]
-            num_complete_fires_per_sample = torch.floor(total_alpha_per_sample).long()  # [B, 1]
+            num_complete_fires_per_sample = torch.floor(
+                total_alpha_per_sample
+            ).long()  # [B, 1]
             # Always run the dynamic maximum fire calculation to build the exact same autograd graph in both passes
-            num_complete_fires_dyn = max(1, int(num_complete_fires_per_sample.max().item()))
+            num_complete_fires_dyn = max(
+                1, int(num_complete_fires_per_sample.max().item())
+            )
             if self.training:
                 if r_step not in self._saved_num_fires:
                     self._saved_num_fires[r_step] = num_complete_fires_dyn
                 num_complete_fires = self._saved_num_fires[r_step]
             else:
                 num_complete_fires = num_complete_fires_dyn
-            print(f"[Compressor DEBUG] training={self.training}, r_step={r_step}, saved={self._saved_num_fires}, dyn={num_complete_fires_dyn}, selected={num_complete_fires}")
+            if push_compressor_debug is not None:
+                push_compressor_debug(
+                    layer_id=getattr(self, "layer_id", -1),
+                    r_step=r_step,
+                    training=self.training,
+                    saved_num_fires=self._saved_num_fires,
+                    num_complete_fires_dyn=num_complete_fires_dyn,
+                    num_complete_fires=num_complete_fires,
+                )
 
             # 6. Scatter-add alpha-weighted KV and gate into fire buckets
             fire_idx = fire_bucket.expand(-1, -1, d)  # [B, S, D]
@@ -371,10 +393,15 @@ class Compressor(nn.Module):
                 (bsz, num_buckets, 1), seqlen, device=x.device, dtype=torch.float32
             )
             min_pos_per_fire.scatter_reduce_(
-                1, fire_idx_clamped[..., :1], s_range.float(), reduce="amin",
+                1,
+                fire_idx_clamped[..., :1],
+                s_range.float(),
+                reduce="amin",
                 include_self=False,
             )
-            fired_indices_tensor = min_pos_per_fire[:, :num_complete_fires].squeeze(-1).long()
+            fired_indices_tensor = (
+                min_pos_per_fire[:, :num_complete_fires].squeeze(-1).long()
+            )
 
             # Handle zero-fire edge case: if no complete fires, emit one from end
             if num_complete_fires == 0:
@@ -389,7 +416,9 @@ class Compressor(nn.Module):
 
             # 9. Carryover: the trailing partial bucket becomes AR state
             #    remainder = cum_alpha[-1] - floor(cum_alpha[-1])
-            remainder = total_alpha_per_sample - torch.floor(total_alpha_per_sample)  # [B, 1]
+            remainder = total_alpha_per_sample - torch.floor(
+                total_alpha_per_sample
+            )  # [B, 1]
             # The partial bucket's accumulated KV and gate
             accum_kv = fire_kv[:, -1]  # [B, D] — last (partial) bucket
             accum_gate = fire_gate[:, -1]  # [B, D]
