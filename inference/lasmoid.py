@@ -5,6 +5,19 @@ Extracted from monolithic model.py during Phase 0 SOLiD refactoring.
 """
 
 import torch
+# Monkeypatch to bypass a bug in PyTorch's trace symbolizer (ValueError: stoi / storage)
+try:
+    import torch.testing._internal.logging_tensor as lt
+    _orig_symbolize = lt.symbolize_tracebacks
+    def _safe_symbolize(tracebacks_list):
+        try:
+            return _orig_symbolize(tracebacks_list)
+        except ValueError:
+            return [[] for _ in tracebacks_list]
+    lt.symbolize_tracebacks = _safe_symbolize
+except Exception:
+    pass
+
 import torch.nn.functional as F
 from torch import nn
 from typing import Any, List, Optional, Tuple
