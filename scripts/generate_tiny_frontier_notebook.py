@@ -237,7 +237,10 @@ from transformers import AutoTokenizer
 # Use the pre-trained Lasmoid tokenizer
 TOK_PATH = str(REPO_DIR)   # tokenizer.json lives at repo root
 tokenizer = AutoTokenizer.from_pretrained(TOK_PATH, use_fast=True)
-tokenizer.pad_token = tokenizer.eos_token
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token_id = 0
+if tokenizer.eos_token_id is None:
+    tokenizer.eos_token_id = tokenizer.pad_token_id
 VOCAB_SIZE = len(tokenizer)
 print(f"Tokenizer vocab size: {VOCAB_SIZE:,}")
 
@@ -481,7 +484,11 @@ def stream_packed(dataset, tokenizer, seq_len: int,
     count = 0
     eos_id = tokenizer.eos_token_id
     if eos_id is None:
-        eos_id = getattr(tokenizer, "sep_token_id", None) or getattr(tokenizer, "pad_token_id", 1)
+        eos_id = tokenizer.sep_token_id
+    if eos_id is None:
+        eos_id = tokenizer.pad_token_id
+    if eos_id is None:
+        eos_id = 0
     for example in dataset:
         text = clean_text(example.get("text", "") or example.get("content", ""))
         if len(text) < MIN_CHARS or len(text) > MAX_CHARS:
@@ -490,6 +497,7 @@ def stream_packed(dataset, tokenizer, seq_len: int,
         ids = tokenizer.encode(formatted, add_special_tokens=True)
         if not isinstance(ids, list):
             ids = ids.tolist() if hasattr(ids, "tolist") else list(ids)
+        ids = [x for x in ids if x is not None]
         ids.append(eos_id)
         buf.extend(ids)
         while len(buf) >= seq_len + 1:
@@ -1499,7 +1507,7 @@ for step in pbar:
             expert_monitor.reset()
             concept_monitor.reset()
 
-print("\\n✅ Training complete!",
+print("\\n✅ Training complete!")
 """)
 )
 

@@ -63,7 +63,6 @@
   "use_relational_cortex": false,
   "use_curiosity_expert": false,
   "use_gvq": false,
-  "use_indexer": false,
   "use_einsum": false,
   "use_block_attnres": false,
   "use_ring_attention": false,
