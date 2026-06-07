@@ -588,7 +588,7 @@ class Lasmoid(nn.Module):
                                 r_step,
                             ),
                             streams,
-                            use_reentrant=True,  # bypass LoggingTensorMode entirely
+                            use_reentrant=False,  # safe for multi-loss backward (CE+KL+VQ+CIF)
                         )
                     )
                 else:
