@@ -273,7 +273,7 @@ def test_case_v2_structured_results():
 
 def test_case_v3_tokenizer_contract():
     """Tokenizer config exposes the long-context Lasmoid special-token contract."""
-    with open("/Users/abhishekjha/CODE/NEXUS/Lasmoid/tokenizer_config.json") as f:
+    with open("/Users/abhishekjha/CODE/NEXUS/Lasmoid/configs/tokenizer/tokenizer_config.json") as f:
         cfg = json.load(f)
     with open("/Users/abhishekjha/CODE/NEXUS/Lasmoid/tokenizer.json") as f:
         tokenizer_json = json.load(f)
@@ -420,7 +420,7 @@ def test_tokenizer_batch_encode_id_range():
 
 def test_tokenizer_vocab_size_matches_config():
     """TokenizerProfile.vocab_size matches the actual tokenizer config."""
-    with open(os.path.join(LASMOID_DIR, "tokenizer_config.json")) as f:
+    with open(os.path.join(LASMOID_DIR, "configs", "tokenizer", "tokenizer_config.json")) as f:
         cfg = json.load(f)
 
     assert LASMOID_TOKENIZER_PROFILE.vocab_size == cfg["vocab_size"], (

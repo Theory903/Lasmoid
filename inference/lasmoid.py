@@ -504,6 +504,7 @@ class Lasmoid(nn.Module):
                             r_step,
                             use_reentrant=False,
                             debug=False,
+                            determinism_check="none",
                         )
                     )
                 else:
