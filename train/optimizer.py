@@ -213,8 +213,17 @@ def clip_grad_global_norm(model, max_norm: float = 1.0) -> float:
 # MUON.STEP CLOSURE-COMPATIBILITY PATCH  (idempotent, safe)
 # ══════════════════════════════════════════════════════════════════════
 
-_MUON_STEP_PATCHED = False
-"""Global guard — ``True`` after :func:`ensure_muon_closure_compat` has run."""
+_ORIG_MUON_STEP = Muon.step
+"""Snapshot of ``Muon.step`` taken at module-import time, *before* any
+notebook cell can monkey-patch it.  Used by :func:`ensure_muon_closure_compat`
+to reconstruct a correct wrapper even when a stale broken patch already
+replaced ``Muon.step`` in the running kernel."""
+
+# Sentinel object — uniquely identifies our patched step function.
+# Using a sentinel instead of a boolean flag avoids stale-kernel state
+# where a previous module import already set ``_MUON_STEP_PATCHED = True``
+# but the actual ``Muon.step`` in memory is still the old broken patch.
+_PATCH_SENTINEL = object()
 
 
 def ensure_muon_closure_compat() -> None:
@@ -236,14 +245,21 @@ def ensure_muon_closure_compat() -> None:
         ensure_muon_closure_compat()
         # Now safe to write notebooks that reference ``_orig_muon_step``
 
-    The function is idempotent – it sets a module-level ``__patched``
-    flag so subsequent calls are instant no-ops.
-    """
-    global _MUON_STEP_PATCHED
-    if _MUON_STEP_PATCHED:
-        return
+    The function is idempotent – it marks the installed wrapper with a unique
+    sentinel so subsequent calls are instant no-ops, even across stale-kernel
+    module re-imports.
 
-    _orig_muon_step = Muon.step
+    **Kernel-stale-patch resilience:**  This function uses ``_ORIG_MUON_STEP``
+    (captured at module import time) rather than ``Muon.step`` (which may
+    already be a broken patch from a stale notebook cell).  This guarantees
+    the patched closure always references the *real* original method.
+    """
+    # Sentinel check — fast-path if our patch is already installed.
+    # This is resilient to stale kernel state because it checks the *actual*
+    # callable on Muon.step, not a module-level flag that persists across
+    # cell re-executions.
+    if getattr(Muon.step, "_lasmoid_patch", None) is _PATCH_SENTINEL:
+        return
 
     @torch.no_grad()
     def _patched_step(self, closure=None):
@@ -251,8 +267,8 @@ def ensure_muon_closure_compat() -> None:
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        return _orig_muon_step(self)
+        # Always call the import-time original, never an intermediate wrapper.
+        return _ORIG_MUON_STEP(self)
 
+    _patched_step._lasmoid_patch = _PATCH_SENTINEL
     Muon.step = _patched_step
-    Muon.step.__patched = True  # noqa
-    _MUON_STEP_PATCHED = True
