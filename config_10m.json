@@ -1,7 +1,7 @@
 {
   "vocab_size": 129286,
-  "max_seq_len": 256,
-  "max_batch_size": 16,
+  "max_seq_len": 128,
+  "max_batch_size": 4,
   "dtype": "bf16",
   "norm_eps": 1e-06,
   "rope_theta": 10000.0,
@@ -10,7 +10,7 @@
   "beta_slow": 1,
   "original_seq_len": 0,
   "swiglu_limit": 10.0,
-  "num_residual_streams": 4,
+  "num_residual_streams": 3,
   "hc_sinkhorn_iters": 8,
   "hc_eps": 1e-06,
   "hcm_ema_alpha": 0.99,
