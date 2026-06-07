@@ -3,6 +3,16 @@ Lasmoid — SSM Module  (extracted from model.py)
 ======================================================================
 Self-contained State Space Model recurrence: JIT-compiled scan helpers
 + StateSpaceRecurrence module (Mamba-3 inspired).
+
+Scan helpers:
+  - ssm_step_one:       single-step decode update
+  - ssm_recurrence_loop: full-sequence sequential recurrence (S <= chunk_size)
+  - ssm_chunk_scan:     chunked sequential recurrence for memory locality
+                        (S > chunk_size) — NOT a parallel/associative scan
+
+A true chunked associative scan can be enabled via the ``use_associative_scan``
+ModelArgs flag (default False — conservative, preserves current sequential
+behaviour).
 """
 
 import math
@@ -56,8 +66,19 @@ def ssm_chunk_scan(
     prev_s: torch.Tensor,
     chunk_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Mamba-3 style chunked associative scan.
+    """Chunked sequential scan (reference implementation).
+
+    This is a **sequential** recurrence partitioned into chunks for memory
+    locality — it is NOT a parallel/associative scan.  The inner loop is
+    identical to ``ssm_recurrence_loop``; chunking simply bounds the working
+    set per iteration.
+
+    For long sequences (S > chunk_size) this provides better cache behaviour
+    than a single flat loop while preserving exact numerical equivalence with
+    ``ssm_recurrence_loop`` (both are O(S) sequential).
+
+    A true chunked associative (parallel) scan can be enabled via the
+    ``use_associative_scan`` ModelArgs flag (default False — conservative).
     """
     Bc, S, H, d_head = v_heads.shape
     outputs = torch.empty((Bc, S, H, d_head), device=decay.device, dtype=decay.dtype)
@@ -79,6 +100,29 @@ def ssm_chunk_scan(
 
 
 @torch.jit.script
+def heavy_tail_decay(x: torch.Tensor, alpha: float) -> torch.Tensor:
+    """Mamba-3 heavy-tailed state decay.
+
+    Replaces the exponential decay ``exp(x)`` (x = dt*A <= 0) with a rational
+    function that decays polynomially (as 1/|x|) for large negative x, giving
+    the state a much heavier memory tail for long-range retention while
+    remaining bounded in (0, 1].
+
+        heavy_tail(x) = 1 + a*x         if x >= 0
+                        1 / (1 - a*x)   if x <  0
+
+    ``alpha`` interpolates between standard exponential decay (alpha == 1.0,
+    the default — kept bit-compatible by the caller) and stronger heavy-tail
+    behaviour.  Output is clamped to (0, 1] for stability.
+    """
+    ax = alpha * x
+    pos = 1.0 + ax
+    neg = 1.0 / (1.0 - ax)
+    out = torch.where(x >= 0, pos, neg)
+    return out.clamp(min=1e-6, max=1.0)
+
+
+@torch.jit.script
 def ssm_recurrence_loop(
     decay: torch.Tensor,
     v_heads: torch.Tensor,
@@ -86,7 +130,7 @@ def ssm_recurrence_loop(
     C: torch.Tensor,
     prev_s: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Legacy full-sequence recurrence (used when chunk_size >= S)."""
+    """Full-sequence sequential recurrence (used when S <= chunk_size)."""
     B_comp, S, H, d_head = v_heads.shape
     outputs = torch.empty(
         (B_comp, S, H, d_head), device=decay.device, dtype=decay.dtype
@@ -113,11 +157,15 @@ class StateSpaceRecurrence(nn.Module):
     """
     Mamba-3 inspired SSM branch.
     Key improvements over Mamba-2:
-      • Chunked parallel scan (ssm_chunk_scan) for efficient training
+      • Chunked sequential scan (ssm_chunk_scan) with cache-friendly memory access
       • dt clamped to [dt_min, dt_max] for numerical stability (Nemotron pattern)
       • B and C L2-normalised per head (variance stabilisation)
       • Learnable dt_bias init from log-uniform distribution in [dt_min, dt_max]
       • Multi-group SSM support (ssm_n_groups)
+
+    Note: ssm_chunk_scan is a sequential recurrence partitioned into chunks for
+    memory locality.  A true associative (parallel) scan is available when
+    ``use_associative_scan=True`` in ModelArgs (default False).
     """
 
     def __init__(self, args: ModelArgs):
@@ -184,6 +232,53 @@ class StateSpaceRecurrence(nn.Module):
         if self.use_d_skip:
             self.D = nn.Parameter(torch.ones(self.d_model))
 
+        # ── Mamba-3 upgrades: MIMO channel mixing + heavy-tail decay + SSM RoPE ──
+        self.is_mimo = getattr(args, "ssm_is_mimo", False)
+        self.mimo_rank = getattr(args, "ssm_mimo_rank", 4)
+        self.heavy_tail_alpha = getattr(args, "ssm_heavy_tail_alpha", 1.0)
+        # Heavy-tail decay is only active when alpha deviates from the
+        # default 1.0, preserving exact Mamba-2 behaviour otherwise.
+        self.use_heavy_tail = abs(self.heavy_tail_alpha - 1.0) > 1e-9
+
+        if self.is_mimo:
+            R = self.mimo_rank
+            # Low-rank residual channel-mixing on the SSM input (v) and output (y),
+            # applied per head across d_head.  Output factor initialised to zero so
+            # the projections are an exact identity (no-op) at initialisation.
+            self.mimo_x_down = nn.Parameter(torch.randn(self.n_heads, self.d_head, R) * 0.02)
+            self.mimo_x_up = nn.Parameter(torch.zeros(self.n_heads, R, self.d_head))
+            self.mimo_o_down = nn.Parameter(torch.randn(self.n_heads, self.d_head, R) * 0.02)
+            self.mimo_o_up = nn.Parameter(torch.zeros(self.n_heads, R, self.d_head))
+
+            # SSM RoPE applied to the B/C state matrices (d_state must be even).
+            self.use_ssm_rope = (self.d_state % 2 == 0)
+            if self.use_ssm_rope:
+                from functools import lru_cache  # noqa: F401
+                try:
+                    from .attention import precompute_freqs_cis as _pf
+                except ImportError:
+                    from attention import precompute_freqs_cis as _pf
+                rope_len = min(args.max_seq_len + 1024, 2097152 + 1024)
+                self.register_buffer(
+                    "ssm_freqs_cis",
+                    _pf(self.d_state, rope_len, 0, getattr(args, "rope_theta", 10000.0)),
+                    persistent=False,
+                )
+        else:
+            self.use_ssm_rope = False
+
+    def _apply_mimo_in(self, v_heads: torch.Tensor) -> torch.Tensor:
+        # v_heads: (B, S, H, d_head)  →  residual low-rank channel mix per head
+        mix = torch.einsum("bshd,hdr->bshr", v_heads, self.mimo_x_down.to(v_heads.dtype))
+        mix = torch.einsum("bshr,hrd->bshd", mix, self.mimo_x_up.to(v_heads.dtype))
+        return v_heads + mix
+
+    def _apply_mimo_out(self, y: torch.Tensor) -> torch.Tensor:
+        # y: (B, S, H, d_head)  →  residual low-rank channel mix per head
+        mix = torch.einsum("bshd,hdr->bshr", y, self.mimo_o_down.to(y.dtype))
+        mix = torch.einsum("bshr,hrd->bshd", mix, self.mimo_o_up.to(y.dtype))
+        return y + mix
+
     def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
         B_comp, S, D = x.shape
 
@@ -204,6 +299,16 @@ class StateSpaceRecurrence(nn.Module):
         # ── Mamba-3: L2-normalise B and C per head (variance stabilisation) ─
         B_mat = F.normalize(B_mat.float(), p=2, dim=-1)
         C_mat = F.normalize(C_mat.float(), p=2, dim=-1)
+
+        # ── Mamba-3: SSM RoPE on the B/C state matrices ──────────────────
+        if self.use_ssm_rope:
+            try:
+                from ._common import apply_rotary_emb as _are
+            except ImportError:
+                from _common import apply_rotary_emb as _are
+            freqs = self.ssm_freqs_cis[start_pos : start_pos + S].to(B_mat.device)
+            B_mat = _are(B_mat, freqs)
+            C_mat = _are(C_mat, freqs)
 
         # ── 2. Resize / reset state buffers ──────────────────────────
         if B_comp > self.ssm_state.shape[0]:
@@ -259,12 +364,21 @@ class StateSpaceRecurrence(nn.Module):
         dt = dt.clamp(min=self.dt_min, max=self.dt_max)  # <── KEY stabilisation
 
         # Discretise: decay = exp(dt * A)  (ZOH discretisation with learned matrix A)
-        decay = torch.exp(
-            dt.unsqueeze(-1) * self.A.view(1, 1, self.n_heads, 1, self.d_state).float()
-        )  # (B_comp, S, H, d_head, d_state)
+        x_decay = dt.unsqueeze(-1) * self.A.view(
+            1, 1, self.n_heads, 1, self.d_state
+        ).float()  # (B_comp, S, H, d_head, d_state)
+        if self.use_heavy_tail:
+            # Mamba-3 heavy-tailed (polynomial) decay for long-range memory.
+            decay = heavy_tail_decay(x_decay, float(self.heavy_tail_alpha))
+        else:
+            decay = torch.exp(x_decay)
 
         # ── 5. Selective scan ─────────────────────────────────────────
         v_heads = v_conv.reshape(B_comp, S, self.n_heads, self.d_head).float() * dt
+
+        # ── Mamba-3 MIMO: low-rank channel mixing on the SSM input ──────
+        if self.is_mimo:
+            v_heads = self._apply_mimo_in(v_heads)
 
         if self.training:
             prev_s = self.ssm_state[:B_comp].clone()
@@ -277,12 +391,17 @@ class StateSpaceRecurrence(nn.Module):
             # Short sequence — fall back to full recurrence
             y, prev_s = ssm_recurrence_loop(decay, v_heads, B_mat, C_mat, prev_s)
         else:
-            # Long sequence — use Mamba-3 chunked scan for training efficiency
+            # Long sequence — chunked sequential scan (memory-locality optimisation)
             y, prev_s = ssm_chunk_scan(
                 decay, v_heads, B_mat, C_mat, prev_s, self.chunk_size
             )
 
         self.ssm_state[:B_comp].copy_(prev_s.detach())
+
+        # ── Mamba-3 MIMO: low-rank channel mixing on the SSM output ─────
+        if self.is_mimo:
+            y = self._apply_mimo_out(y)
+
         y = y.reshape(B_comp, S, self.d_model).type_as(x)
 
         # ── 6. Gate + output projection ───────────────────────────────

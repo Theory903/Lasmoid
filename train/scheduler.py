@@ -20,7 +20,20 @@ def get_wsd_lr_multiplier(
       1. Warmup: Linearly increases from 0.0 to 1.0 (2% default)
       2. Stable: Constant at 1.0 (90% default)
       3. Decay: Cosine decay from 1.0 to min_lr_ratio (8% default)
+
+    Args:
+        step: Current training step (must be >= 0).
+        warmup_steps: Number of steps for linear warmup phase.
+        stable_steps: Number of steps at peak learning rate.
+        decay_steps: Number of steps for cosine decay phase.
+        min_lr_ratio: Minimum LR as a fraction of peak (default 0.0).
+
+    Returns:
+        A multiplier in [min_lr_ratio, 1.0] to scale the base learning rate.
     """
+    if step < 0:
+        return 0.0
+
     total_steps = warmup_steps + stable_steps + decay_steps
     if step >= total_steps:
         return min_lr_ratio

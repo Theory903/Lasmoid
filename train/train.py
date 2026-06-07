@@ -26,6 +26,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from inference.model import Lasmoid, ModelArgs, Linear, compute_loss, compute_grpo_loss
 from optimizer import Muon, get_lr_multiplier
 from reward import reasoning_self_evolution_reward
+from grpo_stability import compute_group_advantages, safe_reward
 
 
 def train():
@@ -417,17 +418,14 @@ def train():
                 for b_g in range(args_cli.batch_size * G):
                     comp_tokens = completions[b_g].tolist()
                     text = enc.decode(comp_tokens)
-                    rewards.append(reasoning_self_evolution_reward(text))
+                    rewards.append(
+                        safe_reward(text, reasoning_self_evolution_reward)
+                    )
 
                 rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
 
                 # 3. Compute relative advantages within each prompt group
-                rewards_grouped = rewards.view(args_cli.batch_size, G)
-                mean_rewards = rewards_grouped.mean(dim=-1, keepdim=True)
-                std_rewards = rewards_grouped.std(dim=-1, keepdim=True) + 1e-8
-                advantages = ((rewards_grouped - mean_rewards) / std_rewards).view(
-                    -1
-                )  # [B * G]
+                advantages = compute_group_advantages(rewards, G)
 
                 # 4. Old policy logprob calculation
                 raw_model.eval()
@@ -555,15 +553,22 @@ def train():
                             event_probs,
                             loss_mask=loss_mask,
                             moe_aux_loss=raw_model.last_moe_loss,
+                            moe_aux_coeff=getattr(
+                                model_args, "moe_aux_coeff", 1.0
+                            ),
                             token_concept_loss=raw_model.last_token_concept_loss,
                             token_concept_coeff=getattr(
                                 model_args, "token_concept_loss_coeff", 0.05
+                            ),
+                            ignore_index=getattr(
+                                model_args, "loss_ignore_index", -100
                             ),
                         )
 
                         # Next-token prediction loss for display
                         ce_loss_next = F.cross_entropy(
-                            logits.view(-1, model_args.vocab_size), yb.view(-1)
+                            logits.view(-1, model_args.vocab_size), yb.view(-1),
+                            ignore_index=getattr(model_args, "loss_ignore_index", -100),
                         )
 
                         # MTP (next-next token) loss
@@ -572,14 +577,20 @@ def train():
                             ce_loss_mtp = F.cross_entropy(
                                 mtp_logits.view(-1, model_args.vocab_size),
                                 yb[:, 1:].contiguous().view(-1),
+                                ignore_index=getattr(
+                                    model_args, "loss_ignore_index", -100
+                                ),
                             )
 
                         pred_coeff = getattr(
                             model_args, "predictive_coding_coeff", 0.01
                         )
+                        mtp_coeff = getattr(
+                            model_args, "mtp_loss_coeff", 0.3
+                        )
                         loss = (
                             main_loss
-                            + 0.3 * ce_loss_mtp
+                            + mtp_coeff * ce_loss_mtp
                             + pred_coeff * raw_model.last_pred_loss
                         )
                         loss = loss / args_cli.grad_accum

@@ -68,6 +68,7 @@ class ElasticSparseConceptMemory(nn.Module):
             codebook_size=args.codebook_size,
             dim=args.dim,
             commitment_cost=args.hcm_commit_loss_coeff,
+            use_gvq=getattr(args, "use_gvq", False),
         )
 
     def process_chunk(
@@ -75,9 +76,13 @@ class ElasticSparseConceptMemory(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, N_enc, D = encoder_hidden.shape
 
-        # Perceiver pooling heads
-        n_heads = 8
-        head_dim = self.dim // n_heads
+        # Perceiver pooling heads — read from config (default 8 preserves legacy behavior)
+        n_heads = getattr(self.args, "perceiver_n_heads", 8)
+        assert D % n_heads == 0, (
+            f"ESCM perceiver pooling: dim ({D}) must be divisible by "
+            f"perceiver_n_heads ({n_heads})"
+        )
+        head_dim = D // n_heads
         KV_4d = encoder_hidden.view(B, N_enc, n_heads, head_dim).transpose(1, 2)
 
         # 1. Pool episodic

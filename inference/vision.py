@@ -167,8 +167,8 @@ class LasmoidVisionEncoder(nn.Module):
             positions_xy = torch.stack([grid_x, grid_y], dim=-1).flatten(0, 1)  # [num_patches, 2]
             positions_xy = positions_xy.unsqueeze(0).expand(B, -1, -1)  # [B, num_patches, 2]
 
-        x_coords = torch.clamp(positions_xy[..., 0], 0, self.pos_emb.size(0) - 1)
-        y_coords = torch.clamp(positions_xy[..., 1], 0, self.pos_emb.size(0) - 1)
+        x_coords = torch.clamp(positions_xy[..., 0], 0, self.pos_emb.size(0) - 1).long()
+        y_coords = torch.clamp(positions_xy[..., 1], 0, self.pos_emb.size(0) - 1).long()
 
         x_emb = self.pos_emb[x_coords, 0, :]
         y_emb = self.pos_emb[y_coords, 1, :]

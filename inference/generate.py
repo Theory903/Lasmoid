@@ -29,6 +29,30 @@ except ImportError:
     from checkpoint_loader import load_checkpoint_and_model
 
 
+def _stability_temperature(model, logits, context_len, base_temperature):
+    """Compute a drift-aware temperature when the model's stability system is on.
+
+    Returns ``base_temperature`` unchanged if stability is disabled.
+    """
+    if not getattr(model, "stability_enabled", False):
+        return base_temperature
+    signals = model.drift_detector.check(logits)
+    return model.temp_scheduler.get_temperature(context_len, signals)
+
+
+def _stability_cache_check(model, step):
+    """Periodic KV-cache integrity check across attention layers (no-op if disabled)."""
+    if not getattr(model, "stability_enabled", False):
+        return
+    checker = getattr(model, "cache_checker", None)
+    if checker is None:
+        return
+    for layer in model.layers:
+        attn = getattr(layer, "attn", None)
+        if attn is not None:
+            checker.check(attn, step)
+
+
 # ══════════════════════════════════════════════════════════════════════
 # GENERATION ENGINE
 # ══════════════════════════════════════════════════════════════════════
@@ -49,10 +73,21 @@ def generate(
     dry_multiplier: float = 0.0,
     dry_base: float = 1.75,
     dry_allowed_length: int = 2,
+    seed: Optional[int] = None,
 ) -> List[List[int]]:
     model.eval()
     device = next(model.parameters()).device
     max_len = model.args.max_seq_len
+
+    # Final logit soft-cap from model config (Req 13.3)
+    final_logit_softcap = getattr(model.args, "final_logit_softcap", None)
+
+    # Determinism: create a dedicated Generator seeded for reproducibility (Req 13.1)
+    generator: Optional[torch.Generator] = None
+    if seed is not None:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
+
     results = []
 
     for tokens_list in prompt_tokens:
@@ -76,10 +111,11 @@ def generate(
 
         # Sample first token
         last_logits = logits[:, -1, :]
+        step_temp = _stability_temperature(model, logits, max_len, temperature)
         idx_next = full_sample(
             last_logits,
             generated_ids,
-            temperature=temperature,
+            temperature=step_temp,
             top_k=top_k,
             top_p=top_p,
             min_p=min_p,
@@ -88,6 +124,8 @@ def generate(
             dry_multiplier=dry_multiplier,
             dry_base=dry_base,
             dry_allowed_length=dry_allowed_length,
+            final_logit_softcap=final_logit_softcap,
+            generator=generator,
         )
 
         token_id = idx_next.item()
@@ -107,10 +145,14 @@ def generate(
                     start_pos=current_pos,
                 )
 
+                step_temp = _stability_temperature(
+                    model, logits, current_pos + 1, temperature
+                )
+                _stability_cache_check(model, step)
                 idx_next = full_sample(
                     logits[:, -1, :],
                     generated_ids,
-                    temperature=temperature,
+                    temperature=step_temp,
                     top_k=top_k,
                     top_p=top_p,
                     min_p=min_p,
@@ -119,6 +161,8 @@ def generate(
                     dry_multiplier=dry_multiplier,
                     dry_base=dry_base,
                     dry_allowed_length=dry_allowed_length,
+                    final_logit_softcap=final_logit_softcap,
+                    generator=generator,
                 )
 
                 token_id = idx_next.item()
@@ -151,10 +195,20 @@ def generate_stream(
     dry_multiplier: float = 0.0,
     dry_base: float = 1.75,
     dry_allowed_length: int = 2,
+    seed: Optional[int] = None,
 ) -> Generator[int, None, None]:
     model.eval()
     device = next(model.parameters()).device
     max_len = model.args.max_seq_len
+
+    # Final logit soft-cap from model config (Req 13.3)
+    final_logit_softcap = getattr(model.args, "final_logit_softcap", None)
+
+    # Determinism: create a dedicated Generator seeded for reproducibility (Req 13.1)
+    generator: Optional[torch.Generator] = None
+    if seed is not None:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
 
     idx = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
     generated_ids: List[int] = list(prompt_tokens)
@@ -174,10 +228,11 @@ def generate_stream(
 
     # Sample first token
     last_logits = logits[:, -1, :]
+    step_temp = _stability_temperature(model, logits, max_len, temperature)
     idx_next = full_sample(
         last_logits,
         generated_ids,
-        temperature=temperature,
+        temperature=step_temp,
         top_k=top_k,
         top_p=top_p,
         min_p=min_p,
@@ -186,6 +241,8 @@ def generate_stream(
         dry_multiplier=dry_multiplier,
         dry_base=dry_base,
         dry_allowed_length=dry_allowed_length,
+        final_logit_softcap=final_logit_softcap,
+        generator=generator,
     )
 
     token_id = idx_next.item()
@@ -207,10 +264,12 @@ def generate_stream(
             start_pos=current_pos,
         )
 
+        step_temp = _stability_temperature(model, logits, current_pos + 1, temperature)
+        _stability_cache_check(model, step)
         idx_next = full_sample(
             logits[:, -1, :],
             generated_ids,
-            temperature=temperature,
+            temperature=step_temp,
             top_k=top_k,
             top_p=top_p,
             min_p=min_p,
@@ -219,6 +278,8 @@ def generate_stream(
             dry_multiplier=dry_multiplier,
             dry_base=dry_base,
             dry_allowed_length=dry_allowed_length,
+            final_logit_softcap=final_logit_softcap,
+            generator=generator,
         )
 
         token_id = idx_next.item()

@@ -136,8 +136,8 @@ def process_dataset():
     parser.add_argument(
         "--max_seq_len", 
         type=int, 
-        default=256,
-        help="Maximum sequence length of the model."
+        default=512,
+        help="Maximum sequence length of the model (must match config max_seq_len)."
     )
     parser.add_argument(
         "--split_ratio", 
@@ -244,6 +244,22 @@ def process_dataset():
                 
         # Convert to numpy uint32 array for compact storage
         tokens_np = np.array(all_tokens, dtype=np.uint32)
+        
+        # ── Validate batch shapes match configured max_seq_len ──
+        num_seqs = len(metadata)
+        expected_total_tokens = num_seqs * args.max_seq_len
+        if len(all_tokens) != expected_total_tokens:
+            print(
+                f"WARNING: Token count mismatch! Expected {expected_total_tokens} "
+                f"({num_seqs} sequences × {args.max_seq_len} seq_len), "
+                f"got {len(all_tokens)}. Data may be truncated or misaligned."
+            )
+        for i, entry in enumerate(metadata):
+            if entry["length"] != args.max_seq_len:
+                raise ValueError(
+                    f"Batch shape error: metadata entry {i} has length "
+                    f"{entry['length']}, expected {args.max_seq_len} (max_seq_len)."
+                )
         
         # Save files
         out_bin_path = os.path.join(lasmoid_dir, "train", f"{args.dataset}_{split_name}.bin")

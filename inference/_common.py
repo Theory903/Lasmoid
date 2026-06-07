@@ -148,8 +148,13 @@ class Linear(nn.Module):
             nn.init.zeros_(self.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if _use_einsum and self.weight.dtype in (torch.bfloat16, torch.float32):
-            # Einsum path (Gemma-4): weight is (out, in), use od->...o equation
+        if (
+            _use_einsum
+            and self.weight.dtype in (torch.bfloat16, torch.float32)
+            and not getattr(self.weight, "use_fp4_weights", False)
+        ):
+            # Einsum path (Gemma-4): weight is (out, in), use '...d,od->...o'
+            # which is mathematically equivalent to F.linear(x, weight).
             x = x.to(self.weight.dtype)
             out = torch.einsum("...d,od->...o", x, self.weight)
             if self.bias is not None:
@@ -164,47 +169,99 @@ class Linear(nn.Module):
 def apply_rotary_emb(
     x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
 ) -> torch.Tensor:
+    """Apply rotary positional embeddings via complex multiplication.
+
+    Handles both 3D (B, S, D) and 4D (B, S, H, D) input tensors, and both
+    2D (S, D//2) and 3D (B, S, D//2) frequency tensors. Uses conjugate for
+    inverse (de-rotation during decoding).
+
+    Args:
+        x: Input tensor, shape (B, S, D) or (B, S, H, D) where D is even.
+        freqs_cis: Complex frequency tensor, shape (S, D//2) or (B, S, D//2).
+        inverse: If True, conjugate freqs_cis to reverse the rotation.
+
+    Returns:
+        Rotated tensor with the same shape and dtype as x.
+
+    Raises:
+        ValueError: On rank mismatch or dimension incompatibility.
+    """
     dtype = x.dtype
     xc = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
     if inverse:
         freqs_cis = freqs_cis.conj()
 
     if freqs_cis.ndim == 2:
+        # freqs_cis shape: (S, D//2)
         if xc.ndim == 3:
+            # xc shape: (B, S, D//2)
             if freqs_cis.size(0) != xc.size(1):
                 raise ValueError(
-                    f"Rotary freq length mismatch: got {freqs_cis.size(0)} positions for sequence length {xc.size(1)}"
+                    f"Rotary freq length mismatch: got {freqs_cis.size(0)} positions "
+                    f"for sequence length {xc.size(1)}"
+                )
+            if freqs_cis.size(1) != xc.size(-1):
+                raise ValueError(
+                    f"Rotary freq dim mismatch: got {freqs_cis.size(1)} freq dims "
+                    f"for head half-dim {xc.size(-1)}"
                 )
             freqs_cis = freqs_cis.view(1, xc.size(1), xc.size(-1))
         elif xc.ndim == 4:
+            # xc shape: (B, S, H, D//2)
             if freqs_cis.size(0) != xc.size(1):
                 raise ValueError(
-                    f"Rotary freq length mismatch: got {freqs_cis.size(0)} positions for sequence length {xc.size(1)}"
+                    f"Rotary freq length mismatch: got {freqs_cis.size(0)} positions "
+                    f"for sequence length {xc.size(1)}"
+                )
+            if freqs_cis.size(1) != xc.size(-1):
+                raise ValueError(
+                    f"Rotary freq dim mismatch: got {freqs_cis.size(1)} freq dims "
+                    f"for head half-dim {xc.size(-1)}"
                 )
             freqs_cis = freqs_cis.view(1, xc.size(1), 1, xc.size(-1))
         else:
-            raise ValueError(f"Unsupported rotary tensor rank: {xc.ndim}")
+            raise ValueError(
+                f"Unsupported rotary input rank: expected 3D (B,S,D) or 4D (B,S,H,D) "
+                f"but got {xc.ndim + 1}D input (complex view is {xc.ndim}D)"
+            )
     elif freqs_cis.ndim == 3:
+        # freqs_cis shape: (B, S, D//2) or (1, S, D//2)
         if xc.ndim == 3:
+            # xc shape: (B, S, D//2) — direct broadcast
             if freqs_cis.shape[-1] != xc.size(-1):
                 raise ValueError(
-                    f"Rotary dim mismatch: got {freqs_cis.shape[-1]} vs {xc.size(-1)}"
+                    f"Rotary freq dim mismatch: got {freqs_cis.shape[-1]} freq dims "
+                    f"for head half-dim {xc.size(-1)}"
+                )
+            if freqs_cis.shape[1] != xc.size(1) and freqs_cis.shape[1] != 1:
+                raise ValueError(
+                    f"Rotary freq length mismatch: got {freqs_cis.shape[1]} positions "
+                    f"for sequence length {xc.size(1)} (not broadcastable)"
                 )
         elif xc.ndim == 4:
+            # xc shape: (B, S, H, D//2) — need unsqueeze for head dim
             if freqs_cis.shape[-1] != xc.size(-1):
                 raise ValueError(
-                    f"Rotary dim mismatch: got {freqs_cis.shape[-1]} vs {xc.size(-1)}"
+                    f"Rotary freq dim mismatch: got {freqs_cis.shape[-1]} freq dims "
+                    f"for head half-dim {xc.size(-1)}"
                 )
-            if freqs_cis.shape[1] == xc.size(1):
+            if freqs_cis.shape[1] == xc.size(1) or freqs_cis.shape[1] == 1:
                 freqs_cis = freqs_cis.unsqueeze(2)
             else:
                 raise ValueError(
-                    f"Rotary freq length mismatch: got {freqs_cis.shape[1]} positions for sequence length {xc.size(1)}"
+                    f"Rotary freq length mismatch: got {freqs_cis.shape[1]} positions "
+                    f"for sequence length {xc.size(1)} (not broadcastable)"
                 )
         else:
-            raise ValueError(f"Unsupported rotary tensor rank: {xc.ndim}")
+            raise ValueError(
+                f"Unsupported rotary input rank: expected 3D (B,S,D) or 4D (B,S,H,D) "
+                f"but got {xc.ndim + 1}D input (complex view is {xc.ndim}D)"
+            )
     else:
-        raise ValueError(f"Unsupported rotary frequency rank: {freqs_cis.ndim}")
+        raise ValueError(
+            f"Unsupported rotary frequency rank: expected 2D (S, D//2) or "
+            f"3D (B, S, D//2) but got {freqs_cis.ndim}D"
+        )
 
     xr = torch.view_as_real(xc * freqs_cis.to(torch.complex64)).flatten(-2)
     return xr.to(dtype)

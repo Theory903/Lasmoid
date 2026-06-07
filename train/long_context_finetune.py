@@ -275,16 +275,19 @@ def main():
                 event_probs,
                 loss_mask=loss_mask,
                 moe_aux_loss=model.last_moe_loss,
+                moe_aux_coeff=getattr(model.args, "moe_aux_coeff", 1.0),
                 token_concept_loss=model.last_token_concept_loss,
                 token_concept_coeff=getattr(model.args, "token_concept_loss_coeff", 0.05),
+                ignore_index=getattr(model.args, "loss_ignore_index", -100),
             )
             
             if mtp_logits is not None:
                 ce_loss_mtp = F.cross_entropy(
                     mtp_logits.view(-1, model.args.vocab_size),
-                    yb[:, 1:].contiguous().view(-1)
+                    yb[:, 1:].contiguous().view(-1),
+                    ignore_index=getattr(model.args, "loss_ignore_index", -100),
                 )
-                loss = loss + 0.3 * ce_loss_mtp
+                loss = loss + getattr(model.args, "mtp_loss_coeff", 0.3) * ce_loss_mtp
                 
             loss.backward()
             

@@ -24,6 +24,10 @@ try:
 except ImportError:
     from optimizer import Muon
 
+# Eps constant for numerical stability in division operations (same discipline
+# as Muon's zero-Frobenius-norm guard in optimizer.py).
+_EPS = 1e-8
+
 
 def compute_mopd_loss(
     student_logits: torch.Tensor,
@@ -33,11 +37,17 @@ def compute_mopd_loss(
     loss_mask: Optional[torch.Tensor] = None,
     alpha: float = 0.5,
     temp: float = 2.0,
+    eps: float = _EPS,
 ) -> torch.Tensor:
     """
     Computes MOPD loss:
       Loss = (1 - alpha) * CE(Student, Targets) +
              alpha * (Temp^2) * [0.5 * KL(T1 || S) + 0.5 * KL(T2 || S)]
+
+    Args:
+        eps: Numerical stabilization constant for division (avoids div-by-zero
+             when loss_mask sums to zero). Same discipline as Muon's
+             zero-Frobenius-norm guard.
     """
     vocab_size = student_logits.size(-1)
     
@@ -50,7 +60,7 @@ def compute_mopd_loss(
         reduction="none"
     )
     if loss_mask_flat is not None:
-        ce_loss = (ce_loss_flat * loss_mask_flat).sum() / (loss_mask_flat.sum() + 1e-8)
+        ce_loss = (ce_loss_flat * loss_mask_flat).sum() / (loss_mask_flat.sum() + eps)
     else:
         ce_loss = ce_loss_flat.mean()
         
@@ -66,7 +76,7 @@ def compute_mopd_loss(
     kl_loss_flat = 0.5 * (kl_t1_flat + kl_t2_flat)
     
     if loss_mask_flat is not None:
-        kl_loss = (kl_loss_flat * loss_mask_flat).sum() / (loss_mask_flat.sum() + 1e-8)
+        kl_loss = (kl_loss_flat * loss_mask_flat).sum() / (loss_mask_flat.sum() + eps)
     else:
         kl_loss = kl_loss_flat.mean()
         
@@ -157,8 +167,8 @@ def main():
         else:
             adamw_params.append(p)
             
-    opt_muon = Muon(muon_params, lr=2e-3)
-    opt_adamw = torch.optim.AdamW(adamw_params, lr=args_cli.learning_rate)
+    opt_muon = Muon(muon_params, lr=2e-3, eps=_EPS)
+    opt_adamw = torch.optim.AdamW(adamw_params, lr=args_cli.learning_rate, eps=_EPS)
     
     # 4. Dummy data for demonstration/run checking
     vocab_size = student_args.vocab_size

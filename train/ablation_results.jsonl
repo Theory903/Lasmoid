@@ -1,0 +1,6 @@
+{"variant": "baseline", "params": 8481095, "perplexity": 54840.62388009736, "avg_experts": 2.0, "toolcall_success": 1.0}
+{"variant": "domain_cortex", "params": 8482279, "perplexity": 54366.48604632231, "avg_experts": 2.0, "domain_entropy": 1.3862409591674805, "toolcall_success": 1.0}
+{"variant": "adaptive_k", "params": 8481095, "perplexity": 54893.47984335287, "avg_experts": 4.0, "toolcall_success": 1.0}
+{"variant": "relational", "params": 8483367, "perplexity": 60458.663518025016, "avg_experts": 2.0, "toolcall_success": 1.0}
+{"variant": "curiosity", "params": 8518087, "perplexity": 55520.33105296528, "avg_experts": 2.0, "curiosity": 0.00075531005859375, "toolcall_success": 1.0}
+{"variant": "all_on", "params": 8521543, "perplexity": 55372.53300284803, "avg_experts": 4.0, "domain_entropy": 1.3862847089767456, "curiosity": 0.00078582763671875, "toolcall_success": 1.0}

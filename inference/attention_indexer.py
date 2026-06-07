@@ -90,19 +90,18 @@ class Indexer(nn.Module):
         )
         index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
         if start_pos == 0:
+            # Compute fired_positions once and reuse (Req 18.3)
             fired_positions = self.compressor.fired_indices_buf[:bsz, :cache_len]
             query_positions = torch.arange(seqlen, device=x.device).view(1, seqlen, 1)
             mask = fired_positions.unsqueeze(1) > query_positions
             index_score = index_score.masked_fill(mask, float("-inf"))
         topk_idxs = index_score.topk(min(self.index_topk, cache_len), dim=-1)[1]
         if start_pos == 0:
-            fired_positions = self.compressor.fired_indices_buf[:bsz, :cache_len]
+            # Reuse fired_positions computed above instead of re-slicing the buffer
             fired_steps = torch.gather(
                 fired_positions.unsqueeze(1).expand(-1, seqlen, -1), 2, topk_idxs.long()
             )
-            valids = fired_steps <= torch.arange(seqlen, device=x.device).view(
-                1, seqlen, 1
-            )
+            valids = fired_steps <= query_positions
             topk_idxs = torch.where(valids, topk_idxs + offset, -1)
         else:
             topk_idxs = topk_idxs + offset

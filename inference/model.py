@@ -69,9 +69,9 @@ except ImportError:
 
 # ── Vector Quantizers ───────────────────────────────────────────────────────
 try:
-    from .vq import VectorQuantizer, ResidualVQ
+    from .vq import VectorQuantizer, GraphVectorQuantizer, ResidualVQ
 except ImportError:
-    from vq import VectorQuantizer, ResidualVQ  # type: ignore[import]
+    from vq import VectorQuantizer, GraphVectorQuantizer, ResidualVQ  # type: ignore[import]
 
 # ── Concept Memory ──────────────────────────────────────────────────────────
 try:
@@ -115,6 +115,50 @@ try:
 except ImportError:
     from moe import DeepSeekMoE, Gate
 
+# ── Domain Cortex (brain-like sparse activation) ─────────────────────────────
+try:
+    from .cortex import DomainCortexRouter, sinkhorn_log
+except ImportError:
+    from cortex import DomainCortexRouter, sinkhorn_log
+
+# ── Relational Cortex (Evoformer-style pairwise reasoning) ───────────────────
+try:
+    from .relational import RelationalCortex
+except ImportError:
+    from relational import RelationalCortex
+
+# ── Curiosity Expert (intrinsic-curiosity questioning) ───────────────────────
+try:
+    from .curiosity import CuriosityExpert
+except ImportError:
+    from curiosity import CuriosityExpert
+
+# ── Tools + Reasoning (tool-augmented EDA / scientific reasoning) ─────────────
+try:
+    from .tools import ToolRegistry, ToolResult, ToolSpec, make_eda_registry
+    from .reasoning import (
+        ReasoningController,
+        Verifier,
+        LasmoidReasoner,
+        SocraticReasoner,
+        build_domain_steer,
+        detect_domain_scores,
+        heuristic_score,
+    )
+    from .episodic import EpisodicMemory
+except ImportError:
+    from tools import ToolRegistry, ToolResult, ToolSpec, make_eda_registry
+    from reasoning import (
+        ReasoningController,
+        Verifier,
+        LasmoidReasoner,
+        SocraticReasoner,
+        build_domain_steer,
+        detect_domain_scores,
+        heuristic_score,
+    )
+    from episodic import EpisodicMemory
+
 # ── SSM ─────────────────────────────────────────────────────────────────────
 try:
     from .ssm import StateSpaceRecurrence
@@ -123,9 +167,9 @@ except ImportError:
 
 # ── MTP (Multi-Token Prediction) ────────────────────────────────────────────
 try:
-    from .mtp import MTPBlock
+    from .mtp import MTPBlock, SpeculativeDecoder
 except ImportError:
-    from mtp import MTPBlock
+    from mtp import MTPBlock, SpeculativeDecoder
 
 # ── Main Model ──────────────────────────────────────────────────────────────
 try:

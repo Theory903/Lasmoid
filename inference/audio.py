@@ -6,7 +6,7 @@ macaron-style conformer layers, projection layers, and mel-spectrogram preproces
 """
 
 import math
-from typing import Optional, Tuple, Union
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -21,6 +21,61 @@ except ImportError:
 MODALITY_TEXT = 0
 MODALITY_VISION = 1
 MODALITY_AUDIO = 2
+
+
+def _hz_to_mel(freq: float) -> float:
+    """Convert Hz to Mel scale."""
+    return 2595.0 * math.log10(1.0 + freq / 700.0)
+
+
+def _mel_to_hz(mel: float) -> float:
+    """Convert Mel scale to Hz."""
+    return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
+
+
+def _build_mel_filterbank(
+    n_freqs: int,
+    n_mels: int,
+    sample_rate: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Build a triangular mel filterbank matrix.
+
+    Args:
+        n_freqs: Number of frequency bins (n_fft // 2 + 1)
+        n_mels: Number of mel bands
+        sample_rate: Audio sample rate in Hz
+        device: Target device
+
+    Returns:
+        Tensor of shape [n_mels, n_freqs] with triangular filter weights
+    """
+    f_max = sample_rate / 2.0
+    mel_min = _hz_to_mel(0.0)
+    mel_max = _hz_to_mel(f_max)
+
+    # Uniformly spaced mel points (n_mels + 2 for left/right edges)
+    mel_points = torch.linspace(mel_min, mel_max, n_mels + 2, device=device)
+    hz_points = 700.0 * (10.0 ** (mel_points / 2595.0) - 1.0)
+
+    # FFT bin frequencies
+    fft_freqs = torch.linspace(0.0, f_max, n_freqs, device=device)
+
+    # Build triangular filters
+    filterbank = torch.zeros(n_mels, n_freqs, device=device)
+    for i in range(n_mels):
+        f_left = hz_points[i]
+        f_center = hz_points[i + 1]
+        f_right = hz_points[i + 2]
+
+        # Rising slope
+        up_slope = (fft_freqs - f_left) / (f_center - f_left + 1e-10)
+        # Falling slope
+        down_slope = (f_right - fft_freqs) / (f_right - f_center + 1e-10)
+        filterbank[i] = torch.clamp(torch.minimum(up_slope, down_slope), min=0.0)
+
+    return filterbank
 
 
 def preprocess_audio(
@@ -59,7 +114,6 @@ def preprocess_audio(
         waveform = waveform.float()
 
     try:
-        import torchaudio
         import torchaudio.transforms as T
 
         mel_spectrogram = T.MelSpectrogram(
@@ -74,7 +128,7 @@ def preprocess_audio(
         return mel.transpose(1, 2)  # [B, T_mel, n_mels]
 
     except ImportError:
-        # Fallback to standard PyTorch STFT
+        # Fallback to standard PyTorch STFT with a proper mel filterbank
         B, S = waveform.shape
         window = torch.hann_window(win_length, device=waveform.device)
 
@@ -87,15 +141,19 @@ def preprocess_audio(
             window=window,
             return_complex=True,
         )
-        mag = torch.abs(stft)  # [B, n_fft//2 + 1, T_mel]
+        power_spec = torch.abs(stft).pow(2)  # [B, n_fft//2 + 1, T_mel]
 
-        # Use a simple linear layer to project STFT magnitude bins to n_mels
-        # Initialize weights with simple scaling factor
-        proj = nn.Linear(n_fft // 2 + 1, n_mels, bias=False, device=waveform.device)
-        nn.init.uniform_(proj.weight, 0.0, 1.0 / (n_fft // 2 + 1))
+        # Build a triangular mel filterbank (deterministic, no learnable params)
+        n_freqs = n_fft // 2 + 1
+        mel_filterbank = _build_mel_filterbank(
+            n_freqs, n_mels, sample_rate, device=waveform.device
+        )  # [n_mels, n_freqs]
 
-        mel = proj(mag.transpose(1, 2))  # [B, T_mel, n_mels]
-        return mel
+        # Apply filterbank: [B, n_freqs, T] -> [B, n_mels, T] -> [B, T, n_mels]
+        mel = torch.matmul(mel_filterbank, power_spec)  # [B, n_mels, T_mel]
+        # Log-mel (clamp for numerical stability)
+        mel = torch.log(mel.clamp(min=1e-10))
+        return mel.transpose(1, 2)  # [B, T_mel, n_mels]
 
 
 class ConformerSubsampling(nn.Module):

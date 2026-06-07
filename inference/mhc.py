@@ -1,24 +1,56 @@
-import math
-from typing import Tuple
+"""
+Manifold-Constrained Hyper-Connections (mHC)
+============================================
+Implements DeepSeek-V4 style Sinkhorn-projected residual stream mixing.
+
+The canonical implementation is `ManifoldConstrainedHyperConnection`, used by
+`block.py` to mix parallel residual streams via a doubly stochastic (Birkhoff
+polytope) matrix. When `n_hc == 1` (single stream), the module reduces to a
+plain residual add with no Sinkhorn overhead.
+
+Historical note: A second implementation (`MHCBlock`) existed that used
+`hc_split_sinkhorn` from `kernel.py` with a different parametrisation.
+It was never wired into the active `LasmoidBlock` path and was removed
+during the hardening effort (2025-07-13, task 5.2).
+"""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from ._common import Linear, RMSNorm, set_dtype, default_dtype
-    from .kernel import hc_split_sinkhorn
-    from .config import ModelArgs
+    from ._common import Linear, RMSNorm
 except ImportError:
-    from _common import Linear, RMSNorm, set_dtype, default_dtype
-    from kernel import hc_split_sinkhorn
-    from config import ModelArgs
+    from _common import Linear, RMSNorm
 
 
 class ManifoldConstrainedHyperConnection(nn.Module):
-    def __init__(self, dim: int, n_hc: int):
+    """Sinkhorn-projected doubly stochastic mixing of parallel residual streams.
+
+    Args:
+        dim: hidden dimension per stream.
+        n_hc: number of parallel residual streams (hyper-connection multiplicity).
+        sinkhorn_iters: number of row/column normalisation iterations for the
+            Sinkhorn-Knopp projection (read from config via ``hc_sinkhorn_iters``).
+
+    When ``n_hc == 1`` the module becomes a no-op identity (plain residual add):
+    A_l = 1, B_l = [[1]], C_l = 1, so the caller's ``B_l @ streams + C_l * output``
+    reduces to ``streams + output``.
+    """
+
+    def __init__(self, dim: int, n_hc: int, sinkhorn_iters: int = 20):
         super().__init__()
         self.n_hc = n_hc
+        self.dim = dim
+        self.sinkhorn_iters = sinkhorn_iters
+
+        # Single-stream shortcut: no learnable parameters needed — acts as
+        # identity gating (plain residual add).
+        if n_hc == 1:
+            # Register dummy buffers so forward() can return correct shapes
+            # without any learnable overhead.
+            return
+
         self.norm = RMSNorm(n_hc * dim)
         self.w_pre = Linear(n_hc * dim, n_hc, bias=False)
         self.w_res = Linear(n_hc * dim, n_hc * n_hc, bias=False)
@@ -31,6 +63,15 @@ class ManifoldConstrainedHyperConnection(nn.Module):
     def forward(self, x):
         # x shape: [batch, seq_len, n_hc, dim]
         B, S, H, D = x.shape
+
+        # ── Single-stream fast path: plain residual identity ────────────
+        if self.n_hc == 1:
+            # A_l = 1 (pre-gate), B_l = identity 1x1, C_l = 1 (post-gate)
+            ones_gate = torch.ones(B, S, 1, 1, device=x.device, dtype=x.dtype)
+            eye_mix = torch.ones(B, S, 1, 1, device=x.device, dtype=x.dtype)
+            return ones_gate, eye_mix, ones_gate
+
+        # ── Multi-stream path: full Sinkhorn mixing ─────────────────────
         x_flat = x.reshape(B, S, H * D)
         x_flat = self.norm(x_flat)
 
@@ -44,9 +85,10 @@ class ManifoldConstrainedHyperConnection(nn.Module):
         A_l = torch.sigmoid(a_raw).unsqueeze(-1)
         C_l = (2.0 * torch.sigmoid(c_raw)).to(x_flat.dtype).unsqueeze(-1)
 
-        # Sinkhorn-Knopp on exp(b_raw) for exactly 20 iterations in float32 for numerical stability
+        # Sinkhorn-Knopp on exp(b_raw) for configured iterations in float32
+        # for numerical stability
         M = torch.exp(b_raw.float())
-        for _ in range(20):
+        for _ in range(self.sinkhorn_iters):
             M = F.normalize(M, p=1, dim=1)  # Column norm
             M = F.normalize(M, p=1, dim=2)  # Row norm
         B_l = M.view(B, S, self.n_hc, self.n_hc).to(
@@ -54,59 +96,3 @@ class ManifoldConstrainedHyperConnection(nn.Module):
         )  # Projected onto Birkhoff polytope
 
         return A_l, B_l, C_l
-
-
-class MHCBlock(nn.Module):
-    def __init__(
-        self, dim: int, hc_mult: int = 4, sinkhorn_iters: int = 20, eps: float = 1e-6
-    ):
-        super().__init__()
-        self.hc_mult = hc_mult
-        self.hc_sinkhorn_iters = sinkhorn_iters
-        self.hc_eps = eps
-        mix_hc = (2 + hc_mult) * hc_mult
-        hc_dim = hc_mult * dim
-
-        with set_dtype(torch.float32):
-            self.hc_fn = nn.Parameter(torch.empty(mix_hc, hc_dim))
-            self.hc_base = nn.Parameter(torch.empty(mix_hc))
-            self.hc_scale = nn.Parameter(torch.empty(3))
-
-        nn.init.normal_(self.hc_fn, 0, 0.02)
-        nn.init.zeros_(self.hc_base)
-        nn.init.ones_(self.hc_scale)
-
-    def hc_pre(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        dtype = x.dtype
-        B, S, hc, D = x.size()
-        x_flat = x.flatten(2)
-        mean_sq = x_flat.square().mean(-1, keepdim=True).float()
-        rsqrt = torch.rsqrt(mean_sq + self.hc_eps).to(dtype)
-        mixes = F.linear(x_flat, self.hc_fn.to(dtype)) * rsqrt
-
-        pre, post, comb = hc_split_sinkhorn(
-            mixes.float(),
-            self.hc_scale.float(),
-            self.hc_base.float(),
-            self.hc_mult,
-            self.hc_sinkhorn_iters,
-            self.hc_eps,
-        )
-
-        y = torch.sum(pre.to(dtype).unsqueeze(-1) * x, dim=2)
-        return y, post, comb
-
-    def hc_post(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor,
-        post: torch.Tensor,
-        comb: torch.Tensor,
-    ) -> torch.Tensor:
-        dtype = x.dtype
-        y = post.to(dtype).unsqueeze(-1) * x.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype), residual
-        )
-        return y

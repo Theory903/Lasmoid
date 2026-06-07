@@ -235,6 +235,7 @@ class MLAAttention(Attention):
         self.o_lora_rank = args.o_lora_rank
         self.eps = args.norm_eps
         self.attn_logits_soft_cap = getattr(args, "attn_logits_soft_cap", None)
+        self._cache_valid_len = 0  # Track how many valid positions are in the cache
 
         # Low-rank Q projection
         self.wq_a = Linear(self.dim, self.q_lora_rank)
@@ -314,6 +315,7 @@ class MLAAttention(Attention):
                 self.kv_cache[:B, cutoff:win], self.kv_cache[:B, :cutoff] = kv[
                     :, -win:
                 ].split([win - cutoff, cutoff], dim=1)
+            self._cache_valid_len = min(N, win)
         else:
             write_start = start_pos % win
             if write_start + N <= win:
@@ -323,8 +325,18 @@ class MLAAttention(Attention):
                 part2_len = N - part1_len
                 self.kv_cache[:B, write_start:win] = kv[:, :part1_len]
                 self.kv_cache[:B, 0:part2_len] = kv[:, part1_len:]
+            self._cache_valid_len = min(start_pos + N, win)
 
-        K_cache = kv if start_pos == 0 else self.kv_cache[:B]
+        if start_pos == 0:
+            K_cache = kv
+        else:
+            # Only attend to valid (filled) cache positions to avoid attending to zeros.
+            # When cache is full (start_pos + N >= win), use the entire circular buffer.
+            valid = self._cache_valid_len
+            if valid >= win:
+                K_cache = self.kv_cache[:B]
+            else:
+                K_cache = self.kv_cache[:B, :valid]
 
         # Fuse retrieved concept states directly into KV sequence attention space
         if concept_db is not None:
@@ -1048,6 +1060,7 @@ class HybridSlidingGlobal(Attention):
         self.register_buffer(
             "global_write_ptr", torch.zeros(1, dtype=torch.long), persistent=False
         )
+        self._local_cache_valid_len = 0  # Track valid local cache positions
 
         # ── Dual RoPE ──
         self.rope_cache = DualRoPECache(
@@ -1078,17 +1091,26 @@ class HybridSlidingGlobal(Attention):
                 self.local_k_cache[:B, :cutoff] = k_chunks[1]
                 self.local_v_cache[:B, cutoff:win] = v_chunks[0]
                 self.local_v_cache[:B, :cutoff] = v_chunks[1]
+            self._local_cache_valid_len = min(N, win)
 
-            K = self.local_k_cache[:B, :N].unsqueeze(1)
-            V = self.local_v_cache[:B, :N].unsqueeze(1)
+            K = self.local_k_cache[:B, :min(N, win)].unsqueeze(1)
+            V = self.local_v_cache[:B, :min(N, win)].unsqueeze(1)
             is_causal = True
             mask = None
         else:
             slot = start_pos % win
             self.local_k_cache[:B, slot] = self._local_k[:, 0]
             self.local_v_cache[:B, slot] = self._local_v[:, 0]
-            K = self.local_k_cache[:B].unsqueeze(1)
-            V = self.local_v_cache[:B].unsqueeze(1)
+            self._local_cache_valid_len = min(start_pos + 1, win)
+
+            # Only attend to valid positions to avoid attending to zero-filled slots
+            valid = self._local_cache_valid_len
+            if valid >= win:
+                K = self.local_k_cache[:B].unsqueeze(1)
+                V = self.local_v_cache[:B].unsqueeze(1)
+            else:
+                K = self.local_k_cache[:B, :valid].unsqueeze(1)
+                V = self.local_v_cache[:B, :valid].unsqueeze(1)
             is_causal = False
             mask = None
 
@@ -1155,9 +1177,10 @@ class HybridSlidingGlobal(Attention):
         # Full KV for attention: use up to min(ptr, gcache) cached tokens
         avail = min(ptr if start_pos > 0 else N, gcache)
         if start_pos > 0 and N == 1:
-            # Single step decode: use full cache
-            K_cache = self.global_k_cache[:B, :gcache].reshape(B, gcache, Gh, Dh)
-            V_cache = self.global_v_cache[:B, :gcache].reshape(B, gcache, Gh, Dh)
+            # Single step decode: use only the valid portion of the global cache
+            valid_global = min(ptr + 1, gcache)
+            K_cache = self.global_k_cache[:B, :valid_global].reshape(B, valid_global, Gh, Dh)
+            V_cache = self.global_v_cache[:B, :valid_global].reshape(B, valid_global, Gh, Dh)
             is_causal = False
             mask = None
         else:
@@ -1320,6 +1343,7 @@ class HybridSlidingGlobal(Attention):
         self.global_k_cache.detach_().zero_()
         self.global_v_cache.detach_().zero_()
         self.global_write_ptr[0] = 0
+        self._local_cache_valid_len = 0
 
 
 # ══════════════════════════════════════════════════════════════════════

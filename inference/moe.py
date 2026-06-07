@@ -15,9 +15,11 @@ import torch.distributed as dist
 try:
     from .config import ModelArgs
     from ._common import Linear, RMSNorm, set_dtype, default_dtype
+    from .cortex import DomainCortexRouter
 except ImportError:
     from config import ModelArgs
     from _common import Linear, RMSNorm, set_dtype, default_dtype
+    from cortex import DomainCortexRouter
 
 
 class ConceptExpert(nn.Module):
@@ -61,6 +63,28 @@ class Gate(nn.Module):
         self.topk_group = args.topk_group
         self.pending_bias_updates = []
 
+        # ── Domain Cortex (brain-like sparse activation over scientific domains) ──
+        self.use_domain_cortex = getattr(args, "use_domain_cortex", False) and not self.use_hash
+        if self.use_domain_cortex:
+            self.cortex = DomainCortexRouter(
+                dim=args.dim,
+                n_routed_experts=args.n_routed_experts,
+                n_domains=getattr(args, "n_domains", 8),
+                domain_topk=getattr(args, "domain_topk", 2),
+                route_noise=getattr(args, "cortex_route_noise", 1.0),
+                eps=args.norm_eps,
+            )
+        else:
+            self.cortex = None
+        self.last_cortex_aux = torch.tensor(0.0)
+        self.last_expert_mask = None
+        if self.cortex is not None:
+            eligible = self.cortex.domain_topk * self.cortex.experts_per_domain
+            assert eligible >= self.topk, (
+                f"domain_topk*experts_per_domain ({eligible}) must be >= "
+                f"n_activated_experts ({self.topk}) so enough experts remain eligible"
+            )
+
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
         nn.init.normal_(self.weight, 0.0, 0.02)
 
@@ -92,7 +116,28 @@ class Gate(nn.Module):
         self,
         x: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
+        domain_steer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute expert routing scores and select top-k experts.
+
+        Routing modes (determined by ``DeepSeekMoE.adaptive_routing``):
+          • **Fixed top-k** (default, exercised by Tiny_Config):
+            Selects exactly ``n_activated_experts`` per token.  Gathered gate
+            weights are renormalized to sum 1.0 (±1e-5), then scaled by
+            ``route_scale``.
+          • **Adaptive / nucleus** (``moe_adaptive_routing=True``):
+            Variable-k selection via ``_adaptive_select``; also renormalizes
+            to 1.0 before route_scale.
+
+        Both paths guarantee every expert is reachable given sufficient batch
+        diversity (no dead experts by design for non-hash routing).
+
+        Returns:
+            weights: [N, topk] renormalized gate weights (sum ≈ route_scale).
+            indices: [N, topk] selected expert indices.
+            z_loss: scalar router z-loss.
+            router_probs: [N, n_routed] full probability distribution.
+        """
         # Gemma 4 Router Norm & Scale
         x_norm = x.float() * torch.rsqrt(
             x.float().square().mean(-1, keepdim=True) + 1e-6
@@ -122,6 +167,20 @@ class Gate(nn.Module):
             ).unsqueeze(0)
         else:
             scores_for_choice = scores
+
+        # ── Domain Cortex: mask experts outside the active cortical columns ──
+        # Brain-like sparse activation: only experts whose domain column was
+        # selected (top-k) for this token remain eligible for expert top-k.
+        if self.cortex is not None:
+            expert_mask, _domain_probs, _domain_idx, cortex_aux = self.cortex(
+                router_input, domain_steer=domain_steer
+            )
+            scores_for_choice = scores_for_choice.masked_fill(~expert_mask, float("-inf"))
+            self.last_cortex_aux = cortex_aux
+            self.last_expert_mask = expert_mask
+        else:
+            self.last_cortex_aux = torch.zeros((), device=x.device, dtype=torch.float32)
+            self.last_expert_mask = None
 
         # DeepSeek-V3 Group-wise routing
         if self.n_group > 1:
@@ -183,7 +242,10 @@ class Gate(nn.Module):
 
         weights = router_probs.gather(1, indices)
 
-        # Gemma 4 style top-k renormalization to prevent probability leakage
+        # ── Top-k renormalization (Req 6.1) ──────────────────────────────
+        # Ensures selected gate weights sum to exactly 1.0 (within ±1e-5)
+        # before route_scale is applied.  The eps prevents division-by-zero
+        # for degenerate inputs while introducing negligible error (~1e-8).
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
 
         weights = weights * self.route_scale
@@ -197,6 +259,19 @@ class DeepSeekMoE(nn.Module):
       • Expert capacity buffer with token dropping (expert_capacity_factor)
       • Per-expert learnable output scale
       • Auxiliary load-balance loss exposed alongside z-loss
+
+    Routing Modes:
+      • **Fixed top-k** (``moe_adaptive_routing=False``, the default):
+        Every token recruits exactly ``n_activated_experts`` experts.
+        Gate weights are renormalized to sum 1.0 ± 1e-5 (Req 6.1).
+        **This is the mode exercised by Tiny_Config (config_100m.json).**
+      • **Adaptive / nucleus** (``moe_adaptive_routing=True``):
+        Variable-k expert recruitment via top-p selection, bounded by
+        [moe_min_experts, moe_max_experts].  Also renormalizes to 1.0.
+
+    Both modes ensure every expert is reachable (no dead experts) given
+    sufficient batch diversity, thanks to the positive-score property of
+    sqrtsoftplus routing and uniform weight initialization.
     """
 
     def __init__(self, args: ModelArgs):
@@ -211,6 +286,7 @@ class DeepSeekMoE(nn.Module):
         self.router_z_loss_coeff = getattr(args, "router_z_loss_coeff", 0.001)
         self.router_entropy_coeff = getattr(args, "moe_router_entropy_coeff", 0.001)
         self.capacity_loss_coeff = getattr(args, "moe_capacity_loss_coeff", 0.01)
+        self.cortex_load_balance_coeff = getattr(args, "cortex_load_balance_coeff", 0.01)
 
         self.gate = Gate(0, args)
 
@@ -250,16 +326,165 @@ class DeepSeekMoE(nn.Module):
 
         # Expert dropout: randomly zero token→expert assignments during training
         self.expert_dropout_p = getattr(args, "moe_expert_dropout", 0.0)
+
+        # ── Adaptive (brain-like) variable-k expert recruitment ──────────
+        # Each token recruits a *variable* number of specialised experts via
+        # top-p (nucleus) selection over router probs, bounded by [min, max].
+        # Confident tokens recruit few (cheap); ambiguous tokens recruit more.
+        # The always-on shared (+dense) branch is the cheap base path.
+        self.adaptive_routing = getattr(args, "moe_adaptive_routing", False)
+        self.route_top_p = getattr(args, "moe_route_top_p", 0.5)
+        self.min_experts = max(0, getattr(args, "moe_min_experts", 1))
+        _max = getattr(args, "moe_max_experts", 0)
+        self.max_experts = _max if _max > 0 else self.n_activated
+        self.adaptive_sparsity_coeff = getattr(args, "moe_adaptive_sparsity_coeff", 0.0)
+
         self.last_expert_counts: Optional[torch.Tensor] = None
         self.last_capacity_overflow = torch.tensor(0.0)
         self.last_router_entropy = torch.tensor(0.0)
+        self.last_avg_experts = torch.tensor(float(self.n_activated))
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _adaptive_select(self, probs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Top-p (nucleus) variable-k expert selection per token.
+
+        Selects a variable number of experts per token via nucleus (top-p)
+        selection over router probabilities, bounded by [min_experts, max_experts].
+        Confident tokens recruit few experts; ambiguous tokens recruit more.
+
+        After selection, weights are renormalized to sum to 1.0 (±1e-5) then
+        scaled by ``route_scale``.  This ensures probability mass is conserved
+        across the variable expert set.
+
+        Args:
+            probs: [N, n_routed] (cortex-masked, non-negative router probs).
+
+        Returns:
+            sel: bool [N, n_routed] — which experts are active per token.
+            w: [N, n_routed] — renormalized weights (sum ≈ route_scale per token
+               for selected experts, 0 for unselected).
+        """
+        sorted_p, sorted_i = probs.sort(dim=-1, descending=True)
+        cum = sorted_p.cumsum(dim=-1)
+        # Keep experts until cumulative mass reaches top_p (include the crossing one).
+        keep = (cum - sorted_p) < self.route_top_p
+        if self.min_experts > 0:
+            keep[:, : self.min_experts] = True
+        if self.max_experts < keep.shape[1]:
+            keep[:, self.max_experts :] = False
+        sel = torch.zeros_like(probs, dtype=torch.bool).scatter(1, sorted_i, keep)
+        w = probs * sel
+        # Renormalize selected weights to sum to 1.0, then apply route_scale.
+        # The eps prevents division by zero when all probs are masked out.
+        w_sum = w.sum(dim=-1, keepdim=True)
+        w = w / (w_sum + 1e-8) * self.gate.route_scale
+        return sel, w
+
+    def _adaptive_forward(
+        self, x: torch.Tensor, domain_steer: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         shape = x.shape
         flat_x = x.reshape(-1, self.dim)
         N_tokens = flat_x.shape[0]
 
-        weights, indices, z_loss, router_probs = self.gate(flat_x, None)
+        _w, _idx, z_loss, router_probs = self.gate(flat_x, None, domain_steer=domain_steer)
+        probs = router_probs.float()
+        if self.gate.last_expert_mask is not None:
+            probs = probs.masked_fill(~self.gate.last_expert_mask, 0.0)
+
+        sel, w = self._adaptive_select(probs)
+
+        # ── Correct EMA bias for adaptive routing ────────────────────────
+        # Gate.forward computed an EMA bias update based on its internal
+        # fixed top-k indices, but we used adaptive (variable-k) selection
+        # instead.  Replace the stale update with one reflecting actual usage.
+        if self.training and self.gate.bias is not None:
+            with torch.no_grad():
+                # Discard the stale update that Gate.forward appended.
+                if self.gate.pending_bias_updates:
+                    self.gate.pending_bias_updates.pop()
+                # Compute a corrected update from the adaptive selection.
+                counts = sel.float().sum(dim=0)  # [n_routed]
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+                total_tokens = N_tokens * (
+                    dist.get_world_size() if dist.is_initialized() else 1
+                )
+                # routing_fraction: fraction of tokens each expert serves,
+                # normalized by the mean expert count per token for fairness.
+                avg_k = sel.float().sum(dim=1).mean().item()
+                routing_fraction = counts / (total_tokens * max(avg_k, 1.0) / self.n_routed)
+                target_fraction = 1.0 / self.n_routed
+                bias_update = self.gate.ema_bias_lr * (target_fraction - routing_fraction)
+                self.gate.pending_bias_updates.append(bias_update)
+
+        base_x = self.w_down(flat_x) if self.use_latent else flat_x
+        y = torch.zeros_like(base_x, dtype=torch.float32)
+        expert_counts = sel.float().sum(dim=0)  # [n_routed]
+
+        for i, exp in enumerate(self.experts):
+            tok_idx = sel[:, i].nonzero(as_tuple=True)[0]
+            if tok_idx.numel() == 0:
+                continue
+            exp_out = exp(base_x[tok_idx], w[tok_idx, i, None])
+            if self.training and self.expert_dropout_p > 0.0:
+                keep = (
+                    (torch.rand(exp_out.shape[0], device=exp_out.device) > self.expert_dropout_p)
+                    .float()
+                    .unsqueeze(-1)
+                )
+                exp_out = exp_out * keep / (1.0 - self.expert_dropout_p + 1e-8)
+            y.scatter_add_(
+                0,
+                tok_idx.unsqueeze(-1).expand(-1, y.shape[-1]),
+                (exp_out * self.per_expert_scale[i].type_as(exp_out)).float(),
+            )
+
+        # ── Three-branch summation (Req 6.2) ────────────────────────────
+        # Branch 1: Routed-expert contributions (accumulated in y above).
+        # Branch 2: Shared expert — always processes all tokens (no dropout).
+        y = y + self.shared(base_x).float()
+        # Branch 3: Dense FFN — always-on parallel dense path (when enabled).
+        if self.use_dual_ffn:
+            y = y + self.dense_branch(self.dense_branch_norm(base_x)).float()
+
+        y = self.w_up(y.type_as(x)) if self.use_latent else y.type_as(x)
+
+        # ── Aux losses ──
+        fi = expert_counts / (N_tokens + 1e-8)
+        Pi = router_probs.float().mean(dim=0)
+        load_balance_loss = self.n_routed * (fi * Pi).sum()
+        router_entropy = (
+            -(router_probs.float() * torch.log(router_probs.float() + 1e-8)).sum(dim=-1).mean()
+        )
+        router_entropy_loss = -router_entropy / math.log(max(2, self.n_routed))
+        avg_experts = sel.float().sum(dim=1).mean()  # mean experts recruited per token
+
+        self.last_expert_counts = expert_counts.detach()
+        self.last_router_entropy = router_entropy.detach()
+        self.last_avg_experts = avg_experts.detach()
+        self.last_capacity_overflow = torch.zeros((), device=x.device)
+
+        aux = (
+            self.router_z_loss_coeff * z_loss
+            + self.load_balance_coeff * load_balance_loss
+            + self.router_entropy_coeff * router_entropy_loss
+            # Sparsity pressure: bias toward recruiting FEW experts ("start small").
+            + self.adaptive_sparsity_coeff * (avg_experts / self.n_routed)
+        )
+        if self.gate.cortex is not None:
+            aux = aux + self.cortex_load_balance_coeff * self.gate.last_cortex_aux
+        return y.reshape(shape), aux
+
+    def forward(
+        self, x: torch.Tensor, domain_steer: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.adaptive_routing:
+            return self._adaptive_forward(x, domain_steer)
+        shape = x.shape
+        flat_x = x.reshape(-1, self.dim)
+        N_tokens = flat_x.shape[0]
+
+        weights, indices, z_loss, router_probs = self.gate(flat_x, None, domain_steer=domain_steer)
 
         # ── Expert capacity: max tokens each expert can receive ──────
         # capacity = ceil(capacity_factor * tokens / n_experts * n_activated)
@@ -331,10 +556,12 @@ class DeepSeekMoE(nn.Module):
                 (exp_out * self.per_expert_scale[i].type_as(exp_out)).float(),
             )
 
-        # Shared expert always processes all tokens (no dropout)
+        # ── Three-branch summation (Req 6.2) ────────────────────────────
+        # Branch 1: Routed-expert contributions (accumulated in y above).
+        # Branch 2: Shared expert — always processes all tokens (no dropout).
         y = y + self.shared(base_x).float()
 
-        # ── Dual dense branch (Gemma4 mlp2): always-on dense path ────────
+        # Branch 3: Dual dense FFN (Gemma4 mlp2) — always-on dense path.
         # Runs in parallel with the sparse MoE to guarantee every token a
         # direct, dense gradient signal — critical for training stability.
         if self.use_dual_ffn:
@@ -353,6 +580,9 @@ class DeepSeekMoE(nn.Module):
             + self.router_entropy_coeff * router_entropy_loss
             + self.capacity_loss_coeff * capacity_overflow
         )
+        # Domain-cortex load-balance (keeps cortical columns evenly utilised).
+        if self.gate.cortex is not None:
+            aux = aux + self.cortex_load_balance_coeff * self.gate.last_cortex_aux
         return y.reshape(shape), aux
 
     def quantize_routed_experts_to_nvfp4(self) -> None:

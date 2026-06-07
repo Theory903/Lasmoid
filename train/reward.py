@@ -29,7 +29,19 @@ def reasoning_self_evolution_reward(
     """
     Reward function for reasoning self-evolution — scores structure,
     reasoning depth, scientific markers, and answer accuracy.
+
+    Raises
+    ------
+    TypeError
+        If ``response`` is not a string (callers should use ``safe_reward`` to
+        catch malformed input rather than calling this directly from untrusted
+        completions).
     """
+    if not isinstance(response, str):
+        raise TypeError(
+            f"reasoning_self_evolution_reward expects a str, got {type(response).__name__}"
+        )
+
     reward = 0.0
 
     has_think = "<think>" in response and "</think>" in response

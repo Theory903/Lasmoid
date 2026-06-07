@@ -223,8 +223,10 @@ def pretrain():
                 event_probs,
                 loss_mask=loss_mask,
                 moe_aux_loss=model.last_moe_loss,
+                moe_aux_coeff=getattr(model_args, "moe_aux_coeff", 1.0),
                 token_concept_loss=model.last_token_concept_loss,
                 token_concept_coeff=getattr(model_args, "token_concept_loss_coeff", 0.05),
+                ignore_index=getattr(model_args, "loss_ignore_index", -100),
             )
 
             # MTP loss
@@ -232,11 +234,14 @@ def pretrain():
             if mtp_logits is not None:
                 ce_loss_mtp = F.cross_entropy(
                     mtp_logits.view(-1, model_args.vocab_size),
-                    yb[:, 1:].contiguous().view(-1)
+                    yb[:, 1:].contiguous().view(-1),
+                    ignore_index=getattr(model_args, "loss_ignore_index", -100),
                 )
+                # MTP loss is now folded into main_loss via mtp_loss param
+                main_loss = main_loss + getattr(model_args, "mtp_loss_coeff", 0.3) * ce_loss_mtp
 
             pred_coeff = getattr(model_args, "predictive_coding_coeff", 0.01)
-            loss = main_loss + 0.3 * ce_loss_mtp + pred_coeff * model.last_pred_loss
+            loss = main_loss + pred_coeff * model.last_pred_loss
             loss = loss / args_cli.grad_accum
             loss.backward()
             total_step_loss += loss.item() * args_cli.grad_accum

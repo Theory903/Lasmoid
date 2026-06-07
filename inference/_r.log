@@ -1,0 +1,11 @@
+........                                                                 [100%]
+=============================== warnings summary ===============================
+../../.venv/lib/python3.13/site-packages/torch/jit/_script.py:1488
+../../.venv/lib/python3.13/site-packages/torch/jit/_script.py:1488
+../../.venv/lib/python3.13/site-packages/torch/jit/_script.py:1488
+../../.venv/lib/python3.13/site-packages/torch/jit/_script.py:1488
+  /Users/abhishekjha/CODE/NEXUS/.venv/lib/python3.13/site-packages/torch/jit/_script.py:1488: DeprecationWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+8 passed, 107 deselected, 4 warnings in 3.13s

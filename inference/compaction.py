@@ -9,7 +9,7 @@ Reference: OMP compaction (ICLR 2026)
 """
 
 from dataclasses import dataclass
-from typing import Tuple, Optional
+from typing import Tuple
 import torch
 
 
@@ -47,6 +47,12 @@ def omp_select_indices(
     config: OMPCompactionConfig,
 ) -> Tuple[torch.LongTensor, torch.Tensor]:
     """Select KV positions via OMP greedy selection.
+
+    Shape contract:
+      k:       [S, D]   — key vectors for one batch element
+      queries: [Q, D]   — query vectors for one batch element
+      Returns: (selected_indices [keep], beta_weights [keep])
+               where 1 <= keep <= int(S * target_ratio)
 
     Returns (selected_indices, beta_weights).
     """
@@ -87,9 +93,15 @@ def omp_select_indices(
             0, device=device
         )
 
+    # Final solve on sorted indices for deterministic output ordering.
+    # Reuse the last beta if the selection is already sorted (avoids redundant
+    # lstsq when k_choice == 1 and selection was appended in order).
     sel_final = torch.tensor(sorted(selected), dtype=torch.long, device=device)
-    m_final = exp_s[:, sel_final]
-    beta_final = _nnls_solve(m_final, target)
+    if torch.equal(sel_t, sel_final):
+        beta_final = beta
+    else:
+        m_final = exp_s[:, sel_final]
+        beta_final = _nnls_solve(m_final, target)
     return sel_final, beta_final
 
 
@@ -101,10 +113,15 @@ def omp_compact(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compact KV cache using OMP greedy key selection.
 
-    Returns (C1, beta_log, C2) where:
-      C1 = selected keys  (batch, keep, head_dim)
-      beta_log = log(beta)
-      C2 = merged values (batch, keep, head_dim)
+    Shape contract:
+      k:       [B, S, D]  — key cache
+      v:       [B, S, D]  — value cache
+      queries: [B, Q, D]  — query vectors driving selection
+      Returns: (C1, beta_log, C2) where:
+        C1       = selected keys   [B, keep, D]
+        beta_log = log(beta)       [B, keep]
+        C2       = selected values [B, keep, D]
+        (keep = number of selected positions, ≤ int(S * target_ratio))
     """
     B, S, D = k.shape
     device = k.device

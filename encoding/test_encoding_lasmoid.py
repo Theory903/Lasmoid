@@ -13,6 +13,8 @@ from encoding_lasmoid import (
     encode_messages, 
     parse_message_from_completion_text, 
     validate_tokenizer_config,
+    LasmoidTokenizer,
+    LASMOID_TOKENIZER_PROFILE,
     REASONING_POLICY,
     MULTIMODAL_SP_TOKENS,
     bos_token,
@@ -351,6 +353,87 @@ def test_case_v3_escaped_tool_arguments_round_trip():
     print("  [PASS] case v3: escaped tool arguments round trip")
 
 
+# ============================================================
+# Tokenizer Round-Trip & ID-Range Tests (Req 17.1, 17.2)
+# ============================================================
+
+LASMOID_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def test_tokenizer_roundtrip():
+    """Encode→decode reproduces in-vocabulary text (Req 17.1)."""
+    tok = LasmoidTokenizer(LASMOID_DIR)
+
+    test_texts = [
+        "Hello, world!",
+        "The quick brown fox jumps over the lazy dog.",
+        "def foo(x): return x + 1",
+        "Unicode: こんにちは世界 🌍",
+        "1234567890",
+        "A" * 100,
+        " ",
+        "a",
+        "mixed CaSe TeXt",
+        "Punctuation: !@#$%^&*()_+-=[]{}|;:,.<>?",
+        "Newlines\nand\ttabs",
+        "Repeated   spaces   here",
+        "Code: if __name__ == '__main__': print('hi')",
+    ]
+
+    for text in test_texts:
+        result = tok.roundtrip(text)
+        assert result == text, (
+            f"Roundtrip failed for {repr(text[:50])}: got {repr(result[:50])}"
+        )
+
+    print("  [PASS] tokenizer roundtrip (Req 17.1)")
+
+
+def test_tokenizer_batch_encode_id_range():
+    """Batch encoding yields ids within [0, vocab_size) (Req 17.2)."""
+    tok = LasmoidTokenizer(LASMOID_DIR)
+    vocab_size = tok.vocab_size
+    assert vocab_size == LASMOID_TOKENIZER_PROFILE.vocab_size
+
+    test_texts = [
+        "Hello world",
+        "Testing batch encode decode",
+        "Lasmoid tokenizer validation",
+        "Mixed 123 numbers and symbols @#$",
+        "A longer passage of text that exercises more of the vocabulary space "
+        "with various words and character patterns.",
+    ]
+
+    batch = tok.batch_encode(test_texts)
+    assert len(batch) == len(test_texts)
+
+    for i, ids in enumerate(batch):
+        assert len(ids) > 0, f"Empty encoding for text at index {i}"
+        for token_id in ids:
+            assert 0 <= token_id < vocab_size, (
+                f"Token id {token_id} out of range [0, {vocab_size}) "
+                f"in batch element {i}"
+            )
+
+    print("  [PASS] batch encode id range [0, vocab_size) (Req 17.2)")
+
+
+def test_tokenizer_vocab_size_matches_config():
+    """TokenizerProfile.vocab_size matches the actual tokenizer config."""
+    with open(os.path.join(LASMOID_DIR, "tokenizer_config.json")) as f:
+        cfg = json.load(f)
+
+    assert LASMOID_TOKENIZER_PROFILE.vocab_size == cfg["vocab_size"], (
+        f"TokenizerProfile.vocab_size={LASMOID_TOKENIZER_PROFILE.vocab_size} "
+        f"!= tokenizer_config.json vocab_size={cfg['vocab_size']}"
+    )
+
+    tok = LasmoidTokenizer(LASMOID_DIR)
+    assert tok.vocab_size == cfg["vocab_size"]
+
+    print("  [PASS] vocab_size consistency check")
+
+
 if __name__ == "__main__":
     print("Running Lasmoid Encoding & Cognitive OS Tests...\n")
     test_case_1()
@@ -363,4 +446,7 @@ if __name__ == "__main__":
     test_case_v3_tokenizer_contract()
     test_case_v3_multimodal_and_embeddings()
     test_case_v3_escaped_tool_arguments_round_trip()
+    test_tokenizer_roundtrip()
+    test_tokenizer_batch_encode_id_range()
+    test_tokenizer_vocab_size_matches_config()
     print("\nAll tests passed successfully!")

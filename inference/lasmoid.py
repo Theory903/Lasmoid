@@ -55,9 +55,45 @@ class Lasmoid(nn.Module):
         self.emb = nn.Embedding(args.vocab_size, args.dim)
         self.external_embedding_proj = None
         self.external_embedding_norm = None
+        if getattr(args, "external_embedding_dim", 0) > 0:
+            self.external_embedding_proj = Linear(
+                args.external_embedding_dim, args.dim, dtype=torch.bfloat16
+            )
+            self.external_embedding_norm = RMSNorm(args.dim, args.norm_eps)
         self.encoder_attn = MLAAttention(args, layer_id=0)
         self.encoder_norm = RMSNorm(args.dim, args.norm_eps)
         self.memory = ElasticSparseConceptMemory(args)
+
+        # Relational Cortex (AlphaFold-3 Evoformer-style pairwise reasoning over
+        # concept anchors). Config-gated; identity at init.
+        self.relational_cortex = None
+        if getattr(args, "use_relational_cortex", False):
+            try:
+                from .relational import RelationalCortex
+            except ImportError:
+                from relational import RelationalCortex
+            self.relational_cortex = RelationalCortex(
+                dim=args.dim,
+                pair_dim=getattr(args, "relational_pair_dim", 16),
+                opm_chan=getattr(args, "relational_opm_chan", 4),
+                n_iters=getattr(args, "relational_iters", 2),
+                eps=args.norm_eps,
+            )
+
+        # Curiosity Expert (intrinsic-curiosity questioning over concept memory).
+        # Config-gated; identity at init (zero-init read-back).
+        self.curiosity_expert = None
+        if getattr(args, "use_curiosity_expert", False):
+            try:
+                from .curiosity import CuriosityExpert
+            except ImportError:
+                from curiosity import CuriosityExpert
+            self.curiosity_expert = CuriosityExpert(
+                dim=args.dim,
+                n_questions=getattr(args, "curiosity_n_questions", 4),
+                eps=args.norm_eps,
+            )
+        self.last_curiosity_loss = torch.tensor(0.0)
 
         # WRITE MASTER (Decoder) — sequence processing blocks
         self.layers = nn.ModuleList(
@@ -354,6 +390,7 @@ class Lasmoid(nn.Module):
         pixel_values: Optional[torch.Tensor] = None,
         audio_values: Optional[torch.Tensor] = None,
         vision_output_length: int = 280,
+        domain_steer: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         Optional[torch.Tensor],
@@ -404,6 +441,19 @@ class Lasmoid(nn.Module):
         )
 
         # Parallel streams routing concept embedding representations
+        # Relational Cortex: refine concept anchors via pairwise (Evoformer-style)
+        # reasoning before they are broadcast into the residual streams.
+        if self.relational_cortex is not None and concept_db is not None:
+            concept_db = self.relational_cortex(concept_db)
+
+        # Curiosity Expert: notice where new content is unpredictable from prior
+        # knowledge and bridge to the most relevant concept slots (self-questioning).
+        if self.curiosity_expert is not None:
+            H_dec, _curiosity, curiosity_loss = self.curiosity_expert(H_dec, concept_db)
+            self.last_curiosity_loss = curiosity_loss
+        else:
+            self.last_curiosity_loss = torch.tensor(0.0, device=x_dec.device, dtype=torch.float32)
+
         H_memory = torch.mean(memory_state, dim=1, keepdim=True).expand(-1, N_dec, -1)
         H_concept = torch.mean(concept_db, dim=1, keepdim=True).expand(-1, N_dec, -1)
 
@@ -443,6 +493,7 @@ class Lasmoid(nn.Module):
                             start_pos,
                             x_dec,
                             layer_feats_slice,
+                            domain_steer,
                             use_reentrant=False,
                         )
                     )
@@ -453,6 +504,7 @@ class Lasmoid(nn.Module):
                         start_pos,
                         x_dec,
                         layer_feats=layer_feats_slice,
+                        domain_steer=domain_steer,
                     )
 
                 if r_step == reasoning_steps - 1:
@@ -563,6 +615,7 @@ class Lasmoid(nn.Module):
         pixel_values: Optional[torch.Tensor] = None,
         audio_values: Optional[torch.Tensor] = None,
         vision_output_length: int = 280,
+        domain_steer: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         self.eval()
@@ -590,6 +643,7 @@ class Lasmoid(nn.Module):
             pixel_values=pixel_values,
             audio_values=audio_values,
             vision_output_length=vision_output_length,
+            domain_steer=domain_steer,
         )
 
         # Autoregressive decode sampling
@@ -630,6 +684,7 @@ class Lasmoid(nn.Module):
                 memory_state=memory_state,
                 start_pos=current_pos,
                 steering_vector=steering_vector,
+                domain_steer=domain_steer,
             )
 
             last_logits = logits[:, -1, :]

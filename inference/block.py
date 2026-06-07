@@ -49,10 +49,10 @@ class LasmoidBlock(nn.Module):
 
         # DeepSeek-V4 Manifold Hyper Connections
         self.mhc_attn = ManifoldConstrainedHyperConnection(
-            args.dim, args.num_residual_streams
+            args.dim, args.num_residual_streams, args.hc_sinkhorn_iters
         )
         self.mhc_ffn = ManifoldConstrainedHyperConnection(
-            args.dim, args.num_residual_streams
+            args.dim, args.num_residual_streams, args.hc_sinkhorn_iters
         )
 
         # Dummy last_pred_loss for compatibility
@@ -77,6 +77,7 @@ class LasmoidBlock(nn.Module):
                 args.dim,
                 block_size=getattr(args, "block_attnres_block_size", 16),
                 n_blocks=getattr(args, "block_attnres_n_blocks", 4),
+                gate_type=getattr(args, "attnres_gate_type", "alpha"),
             )
 
         # Per-layer modality feature projection
@@ -90,6 +91,7 @@ class LasmoidBlock(nn.Module):
         start_pos: int = 0,
         input_ids: Optional[torch.Tensor] = None,
         layer_feats: Optional[torch.Tensor] = None,
+        domain_steer: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -111,11 +113,14 @@ class LasmoidBlock(nn.Module):
         B, S, H, D = attn_in.shape
         attn_in_flat = attn_in.transpose(1, 2).reshape(B * H, S, D)
 
+        # Compute normalized input once (shared by attention and SSM branches)
+        normed_in = self.attn_norm(attn_in_flat)
+
         # Run Attention path
-        attn_out_flat = self.attn(self.attn_norm(attn_in_flat), freqs_cis, start_pos)
+        attn_out_flat = self.attn(normed_in, freqs_cis, start_pos)
 
         # Run Parallel SSM Recurrence path
-        ssm_out_flat = self.ssm_branch(self.attn_norm(attn_in_flat), start_pos)
+        ssm_out_flat = self.ssm_branch(normed_in, start_pos)
 
         # Fuse outputs
         fused_out_flat = attn_out_flat + ssm_out_flat
@@ -136,7 +141,7 @@ class LasmoidBlock(nn.Module):
         B_f, S_f, H_f, D_f = ffn_in.shape
         ffn_in_flat = ffn_in.transpose(1, 2).reshape(B_f * H_f, S_f, D_f)
 
-        ffn_out_flat, z_loss = self.moe_layer(self.ffn_norm(ffn_in_flat))
+        ffn_out_flat, z_loss = self.moe_layer(self.ffn_norm(ffn_in_flat), domain_steer=domain_steer)
 
         if self.use_post_ffw_norm:
             ffn_out_flat = self.post_ffw_norm(ffn_out_flat)

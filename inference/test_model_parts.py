@@ -288,6 +288,46 @@ class TestLasmoidComponents(unittest.TestCase):
         out_train.sum().backward()
         self.assertIsNotNone(x.grad)
 
+    def test_9b_ssm_chunk_scan_equals_recurrence_loop(self):
+        """ssm_chunk_scan output must equal ssm_recurrence_loop within 1e-4.
+
+        Both are sequential recurrences; the chunk scan simply partitions the
+        loop for memory locality.  This test confirms numerical equivalence
+        for the same inputs regardless of chunk_size.
+        """
+        from ssm import ssm_chunk_scan, ssm_recurrence_loop
+
+        torch.manual_seed(1234)
+        B_comp, S, H, d_head, d_state = 2, 80, 2, 32, 8
+        chunk_size = 16  # S > chunk_size triggers ssm_chunk_scan
+
+        # Random inputs in float32 on the test device
+        decay = torch.rand(B_comp, S, H, d_head, d_state, device=self.device)
+        v_heads = torch.randn(B_comp, S, H, d_head, device=self.device)
+        B_mat = torch.randn(B_comp, S, H, d_state, device=self.device)
+        C_mat = torch.randn(B_comp, S, H, d_state, device=self.device)
+        prev_s = torch.zeros(B_comp, H, d_head, d_state, device=self.device)
+
+        # Run both paths from the same initial state
+        out_chunk, state_chunk = ssm_chunk_scan(
+            decay, v_heads, B_mat, C_mat, prev_s.clone(), chunk_size
+        )
+        out_loop, state_loop = ssm_recurrence_loop(
+            decay, v_heads, B_mat, C_mat, prev_s.clone()
+        )
+
+        # Verify equivalence within the multi-step tolerance (1e-4)
+        max_output_diff = (out_chunk - out_loop).abs().max().item()
+        max_state_diff = (state_chunk - state_loop).abs().max().item()
+        self.assertLess(
+            max_output_diff, 1e-4,
+            f"ssm_chunk_scan outputs differ from ssm_recurrence_loop by {max_output_diff}"
+        )
+        self.assertLess(
+            max_state_diff, 1e-4,
+            f"ssm_chunk_scan final state differs from ssm_recurrence_loop by {max_state_diff}"
+        )
+
     def test_10_manifold_hyper_connections(self):
         print("Testing ManifoldConstrainedHyperConnection (mHC Sinkhorn Routing)...")
         mhc = ManifoldConstrainedHyperConnection(
@@ -1799,6 +1839,1220 @@ class TestLasmoidComponents(unittest.TestCase):
 
             self.assertIn("per_layer_proj.weight", model.state_dict())
             self.assertEqual(model.per_layer_proj.weight.shape, (64, 16))
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 7 — Next-Gen feature tests (SSM MIMO, AttnRes gating,
+    #           speculative decoding, 2M config, stability generate loop)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _mimo_args(self):
+        from config import ModelArgs
+
+        a = ModelArgs()
+        a.vocab_size = 200
+        a.dim = 64
+        a.n_layers = 1
+        a.max_seq_len = 64
+        a.max_batch_size = 2
+        a.n_heads = 4
+        a.head_dim = 16
+        a.rope_head_dim = 8
+        a.q_lora_rank = 16
+        a.o_lora_rank = 16
+        a.ssm_heads = 2
+        a.ssm_state_dim = 8
+        a.ssm_chunk_size = 16
+        a.num_residual_streams = 4
+        return a
+
+    def test_73_ssm_mimo_heavy_tail(self):
+        """SSM with MIMO + heavy-tail + SSM RoPE runs and backprops."""
+        from ssm import StateSpaceRecurrence
+
+        a = self._mimo_args()
+        a.ssm_is_mimo = True
+        a.ssm_mimo_rank = 4
+        a.ssm_heavy_tail_alpha = 0.9
+        ssm = StateSpaceRecurrence(a).to(self.device)
+        self.assertTrue(ssm.is_mimo)
+        self.assertTrue(ssm.use_heavy_tail)
+        self.assertTrue(ssm.use_ssm_rope)
+
+        x = torch.randn(2, 20, a.dim, device=self.device, requires_grad=True)
+        out = ssm(x, start_pos=0)
+        self.assertEqual(out.shape, x.shape)
+        self.assertTrue(torch.isfinite(out).all())
+        out.sum().backward()
+        self.assertIsNotNone(x.grad)
+        # MIMO up-projections are learnable
+        self.assertTrue(ssm.mimo_x_up.requires_grad)
+
+    def test_74_ssm_mimo_identity_at_init(self):
+        """MIMO residual mixing is a no-op at init (up-proj initialised to zero)."""
+        from ssm import StateSpaceRecurrence
+
+        a = self._mimo_args()
+        a.ssm_is_mimo = True
+        # alpha=1.0 keeps standard exp decay so only MIMO path differs
+        a.ssm_heavy_tail_alpha = 1.0
+        ssm_mimo = StateSpaceRecurrence(a).to(self.device)
+        self.assertFalse(ssm_mimo.use_heavy_tail)
+        # At init, the MIMO up projections are exactly zero → identity mix
+        self.assertTrue(torch.count_nonzero(ssm_mimo.mimo_x_up) == 0)
+        self.assertTrue(torch.count_nonzero(ssm_mimo.mimo_o_up) == 0)
+        # n_heads=2, d_head=dim/heads=64/2=32
+        v = torch.randn(2, 5, ssm_mimo.n_heads, ssm_mimo.d_head, device=self.device)
+        torch.testing.assert_close(ssm_mimo._apply_mimo_in(v), v)
+        torch.testing.assert_close(ssm_mimo._apply_mimo_out(v), v)
+
+    def test_75_ssm_heavy_tail_stable_extreme(self):
+        """Heavy-tail decay stays bounded in (0,1] for extreme inputs."""
+        from ssm import heavy_tail_decay
+
+        x = torch.tensor([-1e6, -10.0, -0.01, 0.0, 5.0, 1e6])
+        d = heavy_tail_decay(x, 0.9)
+        self.assertTrue(torch.isfinite(d).all())
+        self.assertTrue((d > 0).all())
+        self.assertTrue((d <= 1.0 + 1e-6).all())
+
+    def test_76_attnres_recency_bias_init(self):
+        """BlockAttnRes initialises recency_bias to 10.0."""
+        from attnres import BlockAttnRes
+
+        ar = BlockAttnRes(dim=32, block_size=4, n_blocks=2)
+        self.assertAlmostEqual(ar.recency_bias.item(), 10.0, places=5)
+        self.assertEqual(ar.alpha.item(), 0.0)
+
+    def test_77_attnres_alpha_residual_identity(self):
+        """gate_type='alpha' with alpha=0 is an exact residual at init."""
+        from attnres import BlockAttnRes
+
+        ar = BlockAttnRes(dim=32, block_size=4, n_blocks=2, gate_type="alpha").to(self.device)
+        streams = torch.randn(2, 8, 4, 32, device=self.device)
+        out = ar(streams)
+        torch.testing.assert_close(out, streams)
+
+    def test_78_attnres_gate_types(self):
+        """All gate types produce correctly-shaped finite output."""
+        from attnres import BlockAttnRes
+
+        streams = torch.randn(2, 8, 4, 32, device=self.device)
+        for gt in ("alpha", "scalar", "vector", "none"):
+            ar = BlockAttnRes(dim=32, block_size=4, n_blocks=2, gate_type=gt).to(self.device)
+            out = ar(streams)
+            self.assertEqual(out.shape, streams.shape)
+            self.assertTrue(torch.isfinite(out).all())
+
+    def _spec_model(self):
+        from config import ModelArgs
+        from lasmoid import Lasmoid
+
+        cfg = ModelArgs()
+        cfg.vocab_size = 200
+        cfg.dim = 64
+        cfg.n_layers = 1
+        cfg.max_seq_len = 32
+        cfg.max_batch_size = 2
+        cfg.n_heads = 4
+        cfg.head_dim = 16
+        cfg.rope_head_dim = 8
+        cfg.q_lora_rank = 16
+        cfg.o_lora_rank = 16
+        cfg.n_mtp_layers = 1
+        cfg.mtp_speculation_enabled = True
+        cfg.mtp_draft_length = 6
+        return Lasmoid(cfg).to(self.device), cfg
+
+    def test_79_speculative_decoder_draft_shape(self):
+        """SpeculativeDecoder.draft_tokens returns [B, draft_length] ids."""
+        from mtp import SpeculativeDecoder
+
+        model, cfg = self._spec_model()
+        model.eval()
+        sd = SpeculativeDecoder(model, draft_length=6)
+        self.assertEqual(sd.draft_length, 6)
+
+        B, S = 2, 10
+        streams = torch.randn(B, S, cfg.num_residual_streams, cfg.dim, device=self.device)
+        input_ids = torch.randint(0, cfg.vocab_size, (B, S), device=self.device)
+        freqs = model.freqs_cis[:8]
+        drafts = sd.draft_tokens(streams, freqs, input_ids, start_pos=0, k=6)
+        self.assertEqual(drafts.shape, (B, 6))
+        self.assertEqual(drafts.dtype, torch.long)
+
+    def test_80_speculative_verify_all_accept(self):
+        """When target greedy matches all drafts, all are accepted + bonus."""
+        from mtp import SpeculativeDecoder
+
+        model, cfg = self._spec_model()
+        sd = SpeculativeDecoder(model, draft_length=4)
+
+        B, k, V = 2, 4, cfg.vocab_size
+        draft_ids = torch.randint(0, V, (B, k), device=self.device)
+        # Build target logits whose argmax exactly matches drafts for first k slots
+        target_logits = torch.zeros(B, k + 1, V, device=self.device)
+        for b in range(B):
+            for i in range(k):
+                target_logits[b, i, draft_ids[b, i]] = 100.0
+            target_logits[b, k, 7] = 100.0  # bonus token = 7
+        out, n_acc = sd.verify_drafts(draft_ids, target_logits)
+        self.assertEqual(n_acc, k)
+        self.assertEqual(out.shape, (B, k + 1))
+        torch.testing.assert_close(out[:, :k], draft_ids)
+        self.assertTrue((out[:, k] == 7).all())
+
+    def test_81_speculative_verify_reject(self):
+        """A mismatch truncates acceptance and emits the target correction."""
+        from mtp import SpeculativeDecoder
+
+        model, cfg = self._spec_model()
+        sd = SpeculativeDecoder(model, draft_length=4)
+
+        B, k, V = 1, 4, cfg.vocab_size
+        draft_ids = torch.tensor([[5, 6, 7, 8]], device=self.device)
+        target_logits = torch.zeros(B, k + 1, V, device=self.device)
+        # target greedy: [5, 6, 99, ...] → mismatch at position 2
+        target_logits[0, 0, 5] = 100.0
+        target_logits[0, 1, 6] = 100.0
+        target_logits[0, 2, 99] = 100.0
+        out, n_acc = sd.verify_drafts(draft_ids, target_logits)
+        self.assertEqual(n_acc, 2)
+        self.assertEqual(out.tolist(), [[5, 6, 99]])
+
+    def test_82_speculative_greedy_equivalence(self):
+        """Accepted speculative tokens equal the target model's greedy tokens."""
+        from mtp import SpeculativeDecoder
+
+        model, cfg = self._spec_model()
+        sd = SpeculativeDecoder(model, draft_length=5)
+
+        B, k, V = 3, 5, cfg.vocab_size
+        torch.manual_seed(0)
+        draft_ids = torch.randint(0, V, (B, k), device=self.device)
+        target_logits = torch.randn(B, k + 1, V, device=self.device)
+        target_greedy = target_logits.argmax(dim=-1)
+        out, n_acc = sd.verify_drafts(draft_ids, target_logits)
+        # Every accepted token must equal the target's greedy choice
+        self.assertTrue((out[:, :n_acc] == target_greedy[:, :n_acc]).all())
+        # The correction/bonus token also matches target greedy at slot n_acc
+        self.assertTrue((out[:, n_acc] == target_greedy[:, n_acc]).all())
+
+    def test_83_config_1b_2m_loads(self):
+        """config_1b_2m.json parses into ModelArgs with 2M context + next-gen flags."""
+        import json
+        from dataclasses import fields
+        from config import ModelArgs
+
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_1b_2m.json")
+        with open(path) as f:
+            data = json.load(f)
+
+        valid = {f.name for f in fields(ModelArgs)}
+        filtered = {k: v for k, v in data.items() if k in valid}
+        args = ModelArgs(**filtered)
+
+        self.assertEqual(args.max_seq_len, 2097152)
+        self.assertEqual(args.rope_theta, 1000000.0)
+        self.assertEqual(args.attention_type, "hybrid")
+        self.assertTrue(args.ssm_is_mimo)
+        self.assertTrue(args.mtp_speculation_enabled)
+        self.assertTrue(args.use_fp8_kv)
+        self.assertTrue(args.stability_enabled)
+        self.assertEqual(args.frac_shared_layers, 0.5)
+        self.assertTrue(args.use_einsum)
+        self.assertEqual(args.per_layer_input_dim, 64)
+
+    def test_84_generate_stability_loop(self):
+        """generate.py stability helpers adapt temperature and run cache checks."""
+        from config import ModelArgs
+        from lasmoid import Lasmoid
+        from generate import _stability_temperature, _stability_cache_check
+
+        cfg = ModelArgs()
+        cfg.stability_enabled = True
+        cfg.vocab_size = 200
+        cfg.dim = 64
+        cfg.n_layers = 1
+        cfg.max_seq_len = 32
+        cfg.max_batch_size = 1
+        cfg.n_heads = 4
+        cfg.head_dim = 16
+        cfg.rope_head_dim = 8
+        cfg.q_lora_rank = 16
+        cfg.o_lora_rank = 16
+        model = Lasmoid(cfg).to(self.device)
+        model.eval()
+
+        logits = torch.randn(1, 5, cfg.vocab_size, device=self.device)
+        temp = _stability_temperature(model, logits, context_len=10, base_temperature=0.8)
+        self.assertGreaterEqual(temp, cfg.stability_min_temperature)
+        self.assertLessEqual(temp, cfg.stability_max_temperature)
+        # Cache check should run without raising
+        _stability_cache_check(model, step=0)
+
+        # When stability disabled, base temperature is returned unchanged
+        cfg2 = ModelArgs()
+        cfg2.stability_enabled = False
+        cfg2.vocab_size = 200
+        cfg2.dim = 64
+        cfg2.n_layers = 1
+        cfg2.max_seq_len = 32
+        cfg2.max_batch_size = 1
+        cfg2.n_heads = 4
+        cfg2.head_dim = 16
+        cfg2.rope_head_dim = 8
+        cfg2.q_lora_rank = 16
+        cfg2.o_lora_rank = 16
+        model2 = Lasmoid(cfg2).to(self.device)
+        self.assertEqual(
+            _stability_temperature(model2, logits, 10, 0.8), 0.8
+        )
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Domain Cortex — brain-like sparse activation over scientific domains
+    # ═══════════════════════════════════════════════════════════════════
+
+    def test_85_cortex_router_shapes_and_sparsity(self):
+        """DomainCortexRouter activates exactly domain_topk columns per token."""
+        from cortex import DomainCortexRouter
+
+        router = DomainCortexRouter(
+            dim=64, n_routed_experts=8, n_domains=4, domain_topk=2
+        ).to(self.device)
+        x = torch.randn(10, 64, device=self.device)
+        expert_mask, domain_probs, domain_idx, aux = router(x)
+        self.assertEqual(expert_mask.shape, (10, 8))
+        self.assertEqual(domain_probs.shape, (10, 4))
+        self.assertEqual(domain_idx.shape, (10, 2))
+        # Each token activates exactly domain_topk columns × experts_per_domain experts
+        experts_per_domain = 8 // 4
+        self.assertTrue(
+            torch.all(expert_mask.sum(dim=1) == 2 * experts_per_domain)
+        )
+        self.assertTrue(torch.isfinite(aux))
+
+    def test_86_cortex_affinity_doubly_stochastic(self):
+        """Sinkhorn cross-domain affinity is (approximately) doubly stochastic."""
+        from cortex import DomainCortexRouter
+
+        router = DomainCortexRouter(dim=32, n_routed_experts=8, n_domains=4, domain_topk=2)
+        A = router.domain_affinity()
+        self.assertEqual(A.shape, (4, 4))
+        torch.testing.assert_close(A.sum(dim=1), torch.ones(4), atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(A.sum(dim=0), torch.ones(4), atol=1e-3, rtol=1e-3)
+
+    def test_87_cortex_steering_biases_domain(self):
+        """A strong domain_steer bias forces that column into the active set."""
+        from cortex import DomainCortexRouter
+
+        router = DomainCortexRouter(
+            dim=32, n_routed_experts=8, n_domains=4, domain_topk=1
+        ).to(self.device)
+        x = torch.randn(16, 32, device=self.device)
+        steer = torch.full((4,), -100.0, device=self.device)
+        steer[2] = 100.0  # force domain 2
+        _, _, domain_idx, _ = router(x, domain_steer=steer)
+        self.assertTrue(torch.all(domain_idx[:, 0] == 2))
+
+    def test_88_cortex_gate_masks_experts(self):
+        """Gate with cortex enabled only selects experts inside active columns."""
+        from config import ModelArgs
+        from moe import Gate
+
+        cfg = ModelArgs()
+        cfg.dim = 64
+        cfg.n_routed_experts = 8
+        cfg.n_activated_experts = 2
+        cfg.n_group = 1
+        cfg.use_domain_cortex = True
+        cfg.n_domains = 4
+        cfg.domain_topk = 2  # 2 columns × 2 experts/col = 4 eligible >= 2 activated
+        gate = Gate(0, cfg).to(self.device)
+        gate.eval()
+        x = torch.randn(12, 64, device=self.device)
+        weights, indices, z_loss, router_probs = gate(x)
+        self.assertEqual(indices.shape, (12, 2))
+        self.assertIsNotNone(gate.cortex)
+        # Selected experts must lie within the activated domain columns.
+        experts_per_domain = 8 // 4
+        domain_idx = gate.cortex.last_domain_indices  # [12, 2]
+        for t in range(12):
+            active_domains = set(domain_idx[t].tolist())
+            for e in indices[t].tolist():
+                self.assertIn(e // experts_per_domain, active_domains)
+
+    def test_89_cortex_moe_forward_and_aux(self):
+        """DeepSeekMoE with cortex runs, backprops, and adds a finite aux loss."""
+        from config import ModelArgs
+        from moe import DeepSeekMoE
+
+        cfg = ModelArgs()
+        cfg.dim = 64
+        cfg.n_routed_experts = 8
+        cfg.n_shared_experts = 1
+        cfg.n_activated_experts = 2
+        cfg.n_group = 1
+        cfg.use_domain_cortex = True
+        cfg.n_domains = 4
+        cfg.domain_topk = 2
+        moe = DeepSeekMoE(cfg).to(self.device)
+        x = torch.randn(2, 8, 64, device=self.device, requires_grad=True)
+        y, aux = moe(x)
+        self.assertEqual(y.shape, x.shape)
+        self.assertTrue(torch.isfinite(aux))
+        (y.sum() + aux).backward()
+        self.assertIsNotNone(x.grad)
+        # cortex domain router received gradient
+        self.assertIsNotNone(moe.gate.cortex.domain_weight.grad)
+
+    def test_90_cortex_full_model_integration(self):
+        """Full Lasmoid with use_domain_cortex runs forward with finite logits."""
+        from config import ModelArgs
+        from lasmoid import Lasmoid
+
+        cfg = ModelArgs()
+        cfg.vocab_size = 200
+        cfg.dim = 64
+        cfg.n_layers = 2
+        cfg.max_seq_len = 32
+        cfg.max_batch_size = 1
+        cfg.n_heads = 4
+        cfg.head_dim = 16
+        cfg.rope_head_dim = 8
+        cfg.q_lora_rank = 16
+        cfg.o_lora_rank = 16
+        cfg.n_routed_experts = 8
+        cfg.n_activated_experts = 2
+        cfg.n_group = 1
+        cfg.use_domain_cortex = True
+        cfg.n_domains = 4
+        cfg.domain_topk = 2
+        model = Lasmoid(cfg).to(self.device)
+        x = torch.randint(0, cfg.vocab_size, (1, 12), device=self.device)
+        logits, *_ = model(x, x)
+        self.assertEqual(logits.shape, (1, 12, cfg.vocab_size))
+        self.assertTrue(torch.isfinite(logits).all())
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Tool Registry + EDA toolset
+    # ═══════════════════════════════════════════════════════════════════
+
+    def test_91_tool_registry_validate_and_dispatch(self):
+        from tools import ToolRegistry
+
+        reg = ToolRegistry()
+        reg.register(
+            "add",
+            {"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}, "required": ["a", "b"]},
+            lambda a, b: {"sum": a + b},
+            "add two numbers",
+        )
+        self.assertIsNotNone(reg.validate("add", {"a": 1}))           # missing required
+        self.assertIsNotNone(reg.validate("add", {"a": 1, "b": "x"}))  # wrong type
+        self.assertIsNotNone(reg.validate("nope", {}))                # unknown tool
+        self.assertIsNone(reg.validate("add", {"a": 1, "b": 2}))      # valid
+        res = reg.dispatch("add", {"a": 1, "b": 2})
+        self.assertEqual(res.status, "success")
+        self.assertEqual(res.content["sum"], 3)
+        bad = reg.dispatch("add", {"a": 1})  # error path returns envelope, never raises
+        self.assertEqual(bad.status, "error")
+
+    def test_92_tool_dispatch_call_json_args(self):
+        from tools import make_eda_registry
+        import json as _json
+
+        reg = make_eda_registry()
+        self.assertIn("describe", reg.names())
+        call = {"function": {"name": "describe", "arguments": _json.dumps({"data": [[1.0], [2.0], [3.0]]})}}
+        res = reg.dispatch_call(call)
+        self.assertEqual(res.status, "success")
+        self.assertEqual(res.content["n_rows"], 3)
+        self.assertEqual(res.to_envelope()["role"], "tool")
+
+    def test_93_eda_describe_and_correlate(self):
+        from tools import eda_describe, eda_correlate
+
+        data = [[1.0, 2.0], [2.0, 4.0], [3.0, 6.0], [4.0, 8.0]]
+        d = eda_describe(data)
+        self.assertEqual(d["n_cols"], 2)
+        self.assertAlmostEqual(d["columns"][0]["mean"], 2.5, places=5)
+        c = eda_correlate(data)
+        self.assertAlmostEqual(c["matrix"][0][1], 1.0, places=4)  # perfectly correlated
+
+    def test_94_eda_fit_model_linear(self):
+        from tools import eda_fit_model
+
+        out = eda_fit_model([0.0, 1.0, 2.0, 3.0], [1.0, 3.0, 5.0, 7.0], kind="linear")  # y=2x+1
+        self.assertAlmostEqual(out["coefficients"][0], 1.0, places=3)
+        self.assertAlmostEqual(out["coefficients"][1], 2.0, places=3)
+        self.assertAlmostEqual(out["r2"], 1.0, places=4)
+
+    def test_95_eda_pca_and_cluster(self):
+        from tools import eda_reduce_dim, eda_cluster
+
+        data = [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [10.0, 10.0], [11.0, 11.0]]
+        pca = eda_reduce_dim(data, n_components=1)
+        self.assertGreater(pca["explained_variance_ratio"][0], 0.9)
+        cl = eda_cluster(data, k=2, seed=0)
+        self.assertEqual(len(cl["labels"]), 5)
+        self.assertEqual(cl["labels"][3], cl["labels"][4])  # far points share a cluster
+
+    def test_96_eda_hypothesis_test(self):
+        from tools import eda_hypothesis_test
+
+        out = eda_hypothesis_test([1.0, 2.0, 3.0, 4.0, 5.0], [10.0, 11.0, 12.0, 13.0, 14.0])
+        self.assertEqual(out["test"], "welch_t")
+        self.assertLess(out["p_value_normal_approx"], 0.05)
+
+    def test_96b_eda_numpy_parity(self):
+        """Verify all EDA tools produce results matching NumPy reference computations.
+
+        This confirms no Faked_Math: every tool computes REAL statistics from the data.
+        """
+        try:
+            import numpy as np
+        except ModuleNotFoundError:
+            self.skipTest("numpy not available")
+        from tools import (
+            eda_describe, eda_correlate, eda_fit_model,
+            eda_hypothesis_test, eda_reduce_dim, eda_cluster,
+        )
+
+        rng = np.random.default_rng(42)
+        data = rng.standard_normal((20, 3))
+
+        # ── eda_describe vs NumPy ──
+        desc = eda_describe(data.tolist())
+        for c in range(3):
+            col = data[:, c]
+            self.assertAlmostEqual(desc["columns"][c]["mean"], float(np.mean(col)), places=4)
+            self.assertAlmostEqual(desc["columns"][c]["std"], float(np.std(col, ddof=1)), places=4)
+            self.assertAlmostEqual(desc["columns"][c]["min"], float(np.min(col)), places=4)
+            self.assertAlmostEqual(desc["columns"][c]["max"], float(np.max(col)), places=4)
+            self.assertAlmostEqual(desc["columns"][c]["median"], float(np.median(col)), places=4)
+
+        # ── eda_correlate vs NumPy ──
+        corr = eda_correlate(data.tolist())
+        np_corr = np.corrcoef(data.T)
+        for i in range(3):
+            for j in range(3):
+                self.assertAlmostEqual(corr["matrix"][i][j], float(np_corr[i, j]), places=4)
+
+        # ── eda_fit_model vs NumPy polyfit ──
+        x = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
+        y = 2.5 * x + 1.3 + rng.standard_normal(5) * 0.01  # nearly perfect linear
+        fit = eda_fit_model(x.tolist(), y.tolist(), kind="linear")
+        np_coeffs = np.polyfit(x, y, 1)  # [slope, intercept] (highest degree first)
+        self.assertAlmostEqual(fit["coefficients"][0], float(np_coeffs[1]), places=2)  # intercept
+        self.assertAlmostEqual(fit["coefficients"][1], float(np_coeffs[0]), places=2)  # slope
+        self.assertGreater(fit["r2"], 0.99)
+
+        # ── eda_hypothesis_test vs manual Welch's t ──
+        a = rng.standard_normal(30) + 5.0
+        b = rng.standard_normal(30) + 0.0
+        ht = eda_hypothesis_test(a.tolist(), b.tolist())
+        na, nb = len(a), len(b)
+        va, vb = float(np.var(a, ddof=1)), float(np.var(b, ddof=1))
+        se = np.sqrt(va / na + vb / nb)
+        expected_t = (np.mean(a) - np.mean(b)) / se
+        self.assertAlmostEqual(ht["t_statistic"], round(float(expected_t), 6), places=4)
+        self.assertAlmostEqual(ht["mean_a"], round(float(np.mean(a)), 6), places=4)
+        self.assertAlmostEqual(ht["mean_b"], round(float(np.mean(b)), 6), places=4)
+
+        # ── eda_reduce_dim vs NumPy SVD-based PCA ──
+        pca_data = rng.standard_normal((30, 4))
+        pca = eda_reduce_dim(pca_data.tolist(), n_components=2)
+        centered = pca_data - pca_data.mean(axis=0)
+        _, S, Vh = np.linalg.svd(centered, full_matrices=False)
+        np_var = S**2 / (pca_data.shape[0] - 1)
+        np_ratio = np_var / np_var.sum()
+        self.assertAlmostEqual(pca["explained_variance_ratio"][0], float(np_ratio[0]), places=4)
+        self.assertAlmostEqual(pca["explained_variance_ratio"][1], float(np_ratio[1]), places=4)
+        # Components should match (up to sign)
+        for i in range(2):
+            for j in range(4):
+                self.assertAlmostEqual(
+                    abs(pca["components"][i][j]), abs(float(Vh[i, j])), places=4
+                )
+
+        # ── eda_cluster: verify inertia matches manual computation ──
+        cl_data = np.array([[0.0, 0.0], [0.1, 0.1], [10.0, 10.0], [10.1, 10.1]])
+        cl = eda_cluster(cl_data.tolist(), k=2, seed=7)
+        labels = np.array(cl["labels"])
+        centroids = np.array(cl["centroids"])
+        manual_inertia = sum(
+            np.sum((cl_data[i] - centroids[labels[i]]) ** 2) for i in range(len(cl_data))
+        )
+        self.assertAlmostEqual(cl["inertia"], float(manual_inertia), places=4)
+        # Two obvious clusters should be found
+        self.assertEqual(labels[0], labels[1])
+        self.assertEqual(labels[2], labels[3])
+        self.assertNotEqual(labels[0], labels[2])
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Reasoning controller + domain steering
+    # ═══════════════════════════════════════════════════════════════════
+
+    def test_97_domain_detection_and_steer(self):
+        from reasoning import detect_domain_scores, build_domain_steer
+        from config import ModelArgs
+
+        names = ModelArgs().domain_names
+        scores = detect_domain_scores(
+            "Compute the integral and prove the theorem for this matrix equation", names
+        )
+        self.assertEqual(max(scores, key=scores.get), "mathematics")
+        steer = build_domain_steer("quantum particle energy momentum", names, strength=4.0)
+        self.assertEqual(steer.shape[0], len(names))
+        self.assertGreater(steer[names.index("physics")].item(), 0.0)
+
+    def test_98_verifier_monotonic_and_grounding(self):
+        from reasoning import Verifier
+        from tools import ToolResult
+
+        v = Verifier()
+        self.assertGreater(v.score("The answer is \\boxed{42}"), v.score("hmm not sure"))
+        grounded = v.score("\\boxed{42}", [ToolResult("describe", "success", {})])
+        self.assertGreater(grounded, v.score("\\boxed{42}"))
+
+    def test_99_reasoning_controller_refine_accept(self):
+        from reasoning import ReasoningController, Verifier
+
+        drafts = iter(["thinking about it", "\\boxed{42}"])
+        ctrl = ReasoningController(max_steps=2, verifier=Verifier())
+        t = ctrl.run(
+            propose=lambda: next(drafts),
+            refine=lambda d, c: "\\boxed{42}",
+            critique=lambda d: "add a boxed final answer",
+        )
+        self.assertEqual(t.best_answer, "\\boxed{42}")
+        self.assertTrue(any(s.kind == "refine" and s.accepted for s in t.steps))
+
+    def test_100_reasoning_controller_tool_dispatch(self):
+        from reasoning import ReasoningController, Verifier
+        from tools import make_eda_registry
+        import json as _json
+
+        reg = make_eda_registry()
+        call = "```tool\n" + _json.dumps({"name": "describe", "arguments": {"data": [[1.0], [2.0], [3.0]]}}) + "\n```"
+        ctrl = ReasoningController(registry=reg, max_steps=1, verifier=Verifier())
+        t = ctrl.run(propose=lambda: f"Let me analyze the data. {call}")
+        self.assertGreaterEqual(len(t.steps[0].tool_results), 1)
+        self.assertEqual(t.steps[0].tool_results[0].status, "success")
+
+    def test_101_domain_steer_end_to_end(self):
+        """domain_steer threads through Lasmoid.forward into the cortex gate."""
+        from config import ModelArgs
+        from lasmoid import Lasmoid
+
+        cfg = ModelArgs()
+        cfg.vocab_size = 200
+        cfg.dim = 64
+        cfg.n_layers = 1
+        cfg.max_seq_len = 32
+        cfg.max_batch_size = 1
+        cfg.n_heads = 4
+        cfg.head_dim = 16
+        cfg.rope_head_dim = 8
+        cfg.q_lora_rank = 16
+        cfg.o_lora_rank = 16
+        cfg.n_routed_experts = 8
+        cfg.n_activated_experts = 2
+        cfg.n_group = 1
+        cfg.use_domain_cortex = True
+        cfg.n_domains = 4
+        cfg.domain_topk = 2
+        model = Lasmoid(cfg).to(self.device)
+        steer = torch.zeros(cfg.n_domains, device=self.device)
+        steer[1] = 100.0  # force column 1
+        x = torch.randint(0, cfg.vocab_size, (1, 8), device=self.device)
+        logits, *_ = model(x, x, domain_steer=steer)
+        self.assertEqual(logits.shape, (1, 8, cfg.vocab_size))
+        cortex = model.layers[0].moe_layer.gate.cortex
+        self.assertIsNotNone(cortex)
+        self.assertTrue((cortex.last_domain_indices == 1).any())
+
+    # ═══════════════════════════════════════════════════════════════════
+    # LasmoidReasoner live adapter + EpisodicMemory (R7)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def test_102_lasmoid_reasoner_stub_generate(self):
+        """LasmoidReasoner drives propose→tool→verify→refine over a generate_fn."""
+        from reasoning import LasmoidReasoner, Verifier
+        from tools import make_eda_registry
+        import json as _json
+        from config import ModelArgs
+
+        reg = make_eda_registry()
+        tool_blob = "```tool\n" + _json.dumps(
+            {"name": "describe", "arguments": {"data": [[1.0], [2.0], [3.0]]}}
+        ) + "\n```"
+        # First call (propose) returns a weak draft that requests a tool;
+        # subsequent calls (critique/refine) return a strong boxed answer.
+        calls = {"n": 0}
+
+        def generate_fn(prompt, domain_steer=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # domain steering must be supplied for a cortex-style question
+                assert domain_steer is not None
+                return f"Let me inspect the data {tool_blob}"
+            return "After analysis, \\boxed{2.0}"
+
+        reasoner = LasmoidReasoner(
+            generate_fn,
+            registry=reg,
+            verifier=Verifier(),
+            domain_names=ModelArgs().domain_names,
+            max_steps=2,
+        )
+        t = reasoner.answer("Compute the mean via regression on this dataset variance")
+        self.assertEqual(t.best_answer, "After analysis, \\boxed{2.0}")
+        # the proposed step dispatched the describe tool successfully
+        self.assertTrue(
+            any(r.tool == "describe" and r.status == "success" for r in t.steps[0].tool_results)
+        )
+
+    def test_103_lasmoid_reasoner_from_model(self):
+        """from_model builds a working reasoner around a tiny live model + stub tokenizer."""
+        from reasoning import LasmoidReasoner
+        from config import ModelArgs
+        from lasmoid import Lasmoid
+
+        cfg = ModelArgs()
+        cfg.vocab_size = 60
+        cfg.dim = 64
+        cfg.n_layers = 1
+        cfg.max_seq_len = 32
+        cfg.max_batch_size = 1
+        cfg.n_heads = 4
+        cfg.head_dim = 16
+        cfg.rope_head_dim = 8
+        cfg.q_lora_rank = 16
+        cfg.o_lora_rank = 16
+        cfg.n_routed_experts = 8
+        cfg.n_activated_experts = 2
+        cfg.n_group = 1
+        cfg.use_domain_cortex = True
+        cfg.n_domains = 4
+        cfg.domain_topk = 2
+        cfg.domain_names = ["general", "mathematics", "physics", "data_analysis"]
+        model = Lasmoid(cfg).to(self.device)
+
+        class StubTok:
+            def encode(self, s):
+                return [(ord(c) % 59) + 1 for c in s][:8] or [1]
+            def decode(self, ids):
+                return "".join(chr(65 + (i % 26)) for i in ids)
+
+        reasoner = LasmoidReasoner.from_model(
+            model, StubTok(), max_steps=1, max_new_tokens=3
+        )
+        t = reasoner.answer("integral theorem matrix")
+        self.assertIsInstance(t.best_answer, str)
+        self.assertGreaterEqual(len(t.steps), 1)
+
+    def test_104_episodic_memory_build_and_retrieve(self):
+        from episodic import EpisodicMemory
+
+        torch.manual_seed(0)
+        # Two well-separated clusters in embedding space.
+        a = torch.randn(20, 8) + torch.tensor([5.0] * 8)
+        b = torch.randn(20, 8) - torch.tensor([5.0] * 8)
+        emb = torch.cat([a, b], dim=0)
+        payloads = [f"A{i}" for i in range(20)] + [f"B{i}" for i in range(20)]
+
+        mem = EpisodicMemory(n_episodes=2, seed=0).build(emb, payloads)
+        self.assertEqual(len(mem.episodes), 2)
+
+        # A query near cluster A retrieves the A-dominant episode.
+        q = a.mean(dim=0)
+        ep = mem.retrieve(q, top_k=1)[0]
+        members = mem.episodes[ep].payloads
+        a_frac = sum(1 for p in members if p.startswith("A")) / max(1, len(members))
+        self.assertGreater(a_frac, 0.8)
+
+        ws = mem.working_set(q, top_k=1, max_windows=5)
+        self.assertLessEqual(len(ws), 5)
+        self.assertTrue(all(isinstance(p, str) for p in ws))
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Relational Cortex (Evoformer-style pairwise reasoning)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def test_105_relational_cortex_identity_at_init(self):
+        """RelationalCortex is identity at init (zero-init read-back)."""
+        from relational import RelationalCortex
+
+        rc = RelationalCortex(dim=32, pair_dim=8, opm_chan=4, n_iters=2).to(self.device)
+        single = torch.randn(2, 12, 32, device=self.device)
+        out = rc(single)
+        self.assertEqual(out.shape, single.shape)
+        torch.testing.assert_close(out, single, atol=1e-5, rtol=1e-5)
+
+    def test_106_relational_cortex_learns_and_backprops(self):
+        """After perturbing the read-back, output changes and gradients flow."""
+        from relational import RelationalCortex
+
+        rc = RelationalCortex(dim=32, pair_dim=8, opm_chan=4, n_iters=1).to(self.device)
+        with torch.no_grad():
+            rc.pair_to_single.weight.normal_(0.0, 0.02)
+        single = torch.randn(2, 10, 32, device=self.device, requires_grad=True)
+        out = rc(single)
+        self.assertFalse(torch.allclose(out, single, atol=1e-4))
+        out.sum().backward()
+        self.assertIsNotNone(single.grad)
+        self.assertIsNotNone(rc.opm_left.weight.grad)
+
+    def test_107_relational_cortex_full_model(self):
+        """Lasmoid with use_relational_cortex runs forward with finite logits."""
+        from config import ModelArgs
+        from lasmoid import Lasmoid
+
+        cfg = ModelArgs()
+        cfg.vocab_size = 200
+        cfg.dim = 64
+        cfg.n_layers = 1
+        cfg.max_seq_len = 32
+        cfg.max_batch_size = 1
+        cfg.n_heads = 4
+        cfg.head_dim = 16
+        cfg.rope_head_dim = 8
+        cfg.q_lora_rank = 16
+        cfg.o_lora_rank = 16
+        cfg.num_concepts = 16
+        cfg.num_abstract_concepts = 4
+        cfg.num_global_concepts = 2
+        cfg.use_relational_cortex = True
+        cfg.relational_pair_dim = 8
+        cfg.relational_iters = 1
+        model = Lasmoid(cfg).to(self.device)
+        self.assertIsNotNone(model.relational_cortex)
+        x = torch.randint(0, cfg.vocab_size, (1, 10), device=self.device)
+        logits, *_ = model(x, x)
+        self.assertEqual(logits.shape, (1, 10, cfg.vocab_size))
+        self.assertTrue(torch.isfinite(logits).all())
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Emergent (noisy) routing + adaptive variable-k expert recruitment
+    # ═══════════════════════════════════════════════════════════════════
+
+    def test_108_cortex_noisy_routing_train_vs_eval(self):
+        """Noisy gating randomises routing in train mode, deterministic in eval."""
+        from cortex import DomainCortexRouter
+
+        router = DomainCortexRouter(
+            dim=32, n_routed_experts=8, n_domains=4, domain_topk=2, route_noise=2.0
+        ).to(self.device)
+        x = torch.randn(8, 32, device=self.device)
+
+        router.eval()
+        idx_a = router(x)[2]
+        idx_b = router(x)[2]
+        self.assertTrue(torch.equal(idx_a, idx_b))  # deterministic at inference
+        self.assertIsNotNone(router.noise_weight)
+
+        router.train()
+        torch.manual_seed(1)
+        t1 = router(x)[2]
+        torch.manual_seed(2)
+        t2 = router(x)[2]
+        # With non-zero learned noise this can differ; at minimum it must not crash
+        # and must remain a valid top-k selection.
+        self.assertEqual(t1.shape, (8, 2))
+
+    def test_109_adaptive_select_variable_k(self):
+        """Adaptive selection recruits few experts for peaked probs, more for flat."""
+        from config import ModelArgs
+        from moe import DeepSeekMoE
+
+        cfg = ModelArgs()
+        cfg.dim = 32
+        cfg.n_routed_experts = 8
+        cfg.n_activated_experts = 4
+        cfg.n_group = 1
+        cfg.moe_adaptive_routing = True
+        cfg.moe_route_top_p = 0.8
+        cfg.moe_min_experts = 1
+        cfg.moe_max_experts = 8
+        moe = DeepSeekMoE(cfg).to(self.device)
+
+        # Peaked distribution → few experts; flat distribution → many.
+        peaked = torch.zeros(1, 8, device=self.device); peaked[0, 0] = 1.0
+        flat = torch.full((1, 8), 1.0 / 8, device=self.device)
+        sel_p, _ = moe._adaptive_select(peaked)
+        sel_f, _ = moe._adaptive_select(flat)
+        self.assertLess(int(sel_p.sum()), int(sel_f.sum()))
+        self.assertGreaterEqual(int(sel_p.sum()), 1)  # respects min_experts
+
+    def test_110_adaptive_moe_forward_and_aux(self):
+        """Adaptive MoE runs, backprops, and reports a variable avg expert count."""
+        from config import ModelArgs
+        from moe import DeepSeekMoE
+
+        cfg = ModelArgs()
+        cfg.dim = 64
+        cfg.n_routed_experts = 8
+        cfg.n_shared_experts = 1
+        cfg.n_activated_experts = 4
+        cfg.n_group = 1
+        cfg.moe_adaptive_routing = True
+        cfg.moe_route_top_p = 0.6
+        cfg.moe_min_experts = 1
+        cfg.moe_max_experts = 6
+        cfg.moe_adaptive_sparsity_coeff = 0.01
+        moe = DeepSeekMoE(cfg).to(self.device)
+        x = torch.randn(2, 8, 64, device=self.device, requires_grad=True)
+        y, aux = moe(x)
+        self.assertEqual(y.shape, x.shape)
+        self.assertTrue(torch.isfinite(aux))
+        (y.sum() + aux).backward()
+        self.assertIsNotNone(x.grad)
+        self.assertGreaterEqual(moe.last_avg_experts.item(), 1.0)
+        self.assertLessEqual(moe.last_avg_experts.item(), 6.0)
+
+    def test_111_adaptive_with_cortex_full_model(self):
+        """Adaptive routing + domain cortex compose in a full Lasmoid forward."""
+        from config import ModelArgs
+        from lasmoid import Lasmoid
+
+        cfg = ModelArgs()
+        cfg.vocab_size = 200
+        cfg.dim = 64
+        cfg.n_layers = 1
+        cfg.max_seq_len = 32
+        cfg.max_batch_size = 1
+        cfg.n_heads = 4
+        cfg.head_dim = 16
+        cfg.rope_head_dim = 8
+        cfg.q_lora_rank = 16
+        cfg.o_lora_rank = 16
+        cfg.n_routed_experts = 8
+        cfg.n_activated_experts = 4
+        cfg.n_group = 1
+        cfg.use_domain_cortex = True
+        cfg.n_domains = 4
+        cfg.domain_topk = 2
+        cfg.moe_adaptive_routing = True
+        cfg.moe_route_top_p = 0.7
+        cfg.moe_min_experts = 1
+        cfg.moe_max_experts = 4
+        model = Lasmoid(cfg).to(self.device)
+        x = torch.randint(0, cfg.vocab_size, (1, 10), device=self.device)
+        logits, *_ = model(x, x)
+        self.assertEqual(logits.shape, (1, 10, cfg.vocab_size))
+        self.assertTrue(torch.isfinite(logits).all())
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Curiosity expert + Socratic self-questioning loop
+    # ═══════════════════════════════════════════════════════════════════
+
+    def test_112_curiosity_identity_at_init(self):
+        from curiosity import CuriosityExpert
+
+        ce = CuriosityExpert(dim=32, n_questions=4).to(self.device)
+        h = torch.randn(2, 6, 32, device=self.device)
+        out, cur, loss = ce(h)
+        self.assertEqual(out.shape, h.shape)
+        torch.testing.assert_close(out, h, atol=1e-5, rtol=1e-5)  # zero-init read-back
+        self.assertEqual(cur.shape, (2, 6))
+        self.assertTrue(torch.isfinite(loss))
+
+    def test_113_curiosity_backprop_and_bridge(self):
+        from curiosity import CuriosityExpert
+
+        ce = CuriosityExpert(dim=32, n_questions=4).to(self.device)
+        with torch.no_grad():
+            ce.out.weight.normal_(0.0, 0.02)
+        h = torch.randn(2, 6, 32, device=self.device, requires_grad=True)
+        concept = torch.randn(2, 10, 32, device=self.device)
+        out, cur, loss = ce(h, concept)
+        self.assertFalse(torch.allclose(out, h, atol=1e-4))  # bridge now active
+        (out.sum() + loss).backward()
+        self.assertIsNotNone(h.grad)
+        self.assertIsNotNone(ce.forward_model[0].weight.grad)
+
+    def test_114_curiosity_full_model(self):
+        from config import ModelArgs
+        from lasmoid import Lasmoid
+
+        cfg = ModelArgs()
+        cfg.vocab_size = 200
+        cfg.dim = 64
+        cfg.n_layers = 1
+        cfg.max_seq_len = 32
+        cfg.max_batch_size = 1
+        cfg.n_heads = 4
+        cfg.head_dim = 16
+        cfg.rope_head_dim = 8
+        cfg.q_lora_rank = 16
+        cfg.o_lora_rank = 16
+        cfg.use_curiosity_expert = True
+        cfg.curiosity_n_questions = 4
+        model = Lasmoid(cfg).to(self.device)
+        self.assertIsNotNone(model.curiosity_expert)
+        x = torch.randint(0, cfg.vocab_size, (1, 10), device=self.device)
+        logits, *_ = model(x, x)
+        self.assertEqual(logits.shape, (1, 10, cfg.vocab_size))
+        self.assertTrue(torch.isfinite(logits).all())
+        self.assertTrue(torch.isfinite(model.last_curiosity_loss))
+
+    def test_115_socratic_reasoner_loop(self):
+        from reasoning import SocraticReasoner, parse_questions
+
+        # Stub generator: returns numbered questions for the bridging prompt,
+        # short answers otherwise.
+        def generate_fn(prompt, domain_steer=None):
+            if "List them as 1." in prompt or "Questions:" in prompt:
+                return "1. Why is quantum needed over classical?\n2. How does measurement differ?\n3. What breaks at small scales?"
+            if "Integrated understanding" in prompt:
+                return "Quantum extends classical where measurement is probabilistic."
+            return "Because classical assumptions fail at atomic scale. \\boxed{ok}"
+
+        sr = SocraticReasoner(generate_fn, k=3)
+        qs = sr.ask("quantum mechanics", known="classical physics")
+        self.assertEqual(len(qs), 3)
+        self.assertTrue(all("?" in q for q in qs))
+
+        trace = sr.learn("quantum mechanics", known="classical physics")
+        self.assertEqual(len(trace.questions), 3)
+        self.assertEqual(len(trace.answers), 3)
+        self.assertTrue(trace.synthesis)
+        curriculum = sr.build_curriculum([trace])
+        # 3 Q/A pairs + 1 synthesis example, all non-empty
+        self.assertGreaterEqual(len(curriculum), 1)
+        self.assertTrue(all("prompt" in e and "completion" in e for e in curriculum))
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Training-pipeline math: aux-loss wiring + optimizer split
+    # ═══════════════════════════════════════════════════════════════════
+
+    def test_116_compute_loss_includes_aux_terms(self):
+        """commit + curiosity + CIF terms actually change the loss (were dropped)."""
+        from model import compute_loss
+
+        torch.manual_seed(0)
+        logits = torch.randn(2, 6, 50)
+        targets = torch.randint(0, 50, (2, 6))
+        base = compute_loss(logits, targets, [], [], [])
+        with_aux = compute_loss(
+            logits, targets, [], [], [],
+            commit_loss=torch.tensor(1.0),
+            curiosity_loss=torch.tensor(1.0),
+            commit_coeff=0.25,
+            curiosity_coeff=0.1,
+        )
+        self.assertGreater(with_aux.item(), base.item())
+        self.assertAlmostEqual(with_aux.item() - base.item(), 0.25 + 0.1, places=4)
+
+    def test_117_cif_boundary_loss(self):
+        """CIF boundary loss is a finite non-negative scalar."""
+        from loss import cif_boundary_loss
+
+        eps = [torch.rand(2, 8, 1) for _ in range(3)]
+        v = cif_boundary_loss(eps, target_ratio=0.25, ratio_weight=1.0, entropy_weight=0.01)
+        self.assertEqual(v.shape, ())
+        self.assertTrue(torch.isfinite(v))
+
+    def test_118_build_optimizers_split(self):
+        """Muon takes 2-D body weights; AdamW takes embeddings/head/1-D params."""
+        from train.optimizer import build_param_groups, build_optimizers, Muon
+
+        from config import ModelArgs
+        from lasmoid import Lasmoid
+        cfg = ModelArgs()
+        cfg.vocab_size = 100
+        cfg.dim = 32
+        cfg.n_layers = 1
+        cfg.max_seq_len = 16
+        cfg.max_batch_size = 1
+        cfg.n_heads = 4
+        cfg.head_dim = 8
+        cfg.rope_head_dim = 4
+        cfg.q_lora_rank = 8
+        cfg.o_lora_rank = 8
+        model = Lasmoid(cfg).to(self.device)
+        muon_p, adamw_d, adamw_n = build_param_groups(model)
+        self.assertGreater(len(muon_p), 0)
+        self.assertTrue(all(p.ndim == 2 for p in muon_p))
+        self.assertTrue(all(p.ndim == 1 for p in adamw_n))  # norms/biases/scalars
+        opts = build_optimizers(model, muon_lr=0.02, adamw_lr=1e-3)
+        self.assertTrue(any(isinstance(o, Muon) for o in opts))
+        # one optimisation step runs without error
+        x = torch.randint(0, cfg.vocab_size, (1, 8), device=self.device)
+        logits, *_ = model(x, x)
+        logits.sum().backward()
+        for o in opts:
+            o.step()
+
+    def test_119_muon_noise_adaptive_step(self):
+        """Noise-adaptive Muon scales the step by gradient SNR, stays finite."""
+        from train.optimizer import Muon
+
+        torch.manual_seed(0)
+        w = torch.nn.Parameter(torch.randn(8, 8, device=self.device))
+        opt = Muon([w], lr=0.05, adaptive_noise=True)
+        before = w.detach().clone()
+        # noisy gradient
+        w.grad = torch.randn(8, 8, device=self.device) * 5.0
+        opt.step()
+        self.assertTrue(torch.isfinite(w).all())
+        self.assertFalse(torch.equal(before, w.detach()))
+        # second-moment state is tracked (the noise estimate)
+        self.assertIn("exp_avg_sq", opt.state[w])
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Gate top-k renormalization + dual routing modes audit (Task 7.1)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def test_120_gate_fixed_topk_renormalization(self):
+        """Fixed top-k path: gate weights sum to route_scale (1.0) within 1e-5."""
+        from config import ModelArgs
+        from moe import Gate
+
+        cfg = ModelArgs()
+        cfg.dim = 64
+        cfg.n_routed_experts = 6
+        cfg.n_activated_experts = 2
+        cfg.n_group = 1
+        cfg.route_scale = 1.0
+        gate = Gate(0, cfg).to(self.device)
+        gate.eval()
+
+        torch.manual_seed(42)
+        x = torch.randn(32, cfg.dim, device=self.device)
+        weights, indices, z_loss, router_probs = gate(x)
+
+        # Exactly top-k experts selected per token
+        self.assertEqual(indices.shape, (32, cfg.n_activated_experts))
+        self.assertEqual(weights.shape, (32, cfg.n_activated_experts))
+
+        # Gate weights renormalize to sum 1.0 ± 1e-5 (when route_scale=1.0)
+        weight_sums = weights.sum(dim=-1)
+        max_deviation = (weight_sums - 1.0).abs().max().item()
+        self.assertLess(
+            max_deviation, 1e-5,
+            f"Gate weights deviate from 1.0 by {max_deviation:.2e} (exceeds 1e-5)"
+        )
+
+    def test_121_gate_adaptive_renormalization(self):
+        """Adaptive (nucleus) path: weights sum to route_scale within 1e-5."""
+        from config import ModelArgs
+        from moe import DeepSeekMoE
+
+        cfg = ModelArgs()
+        cfg.dim = 64
+        cfg.n_routed_experts = 6
+        cfg.n_activated_experts = 2
+        cfg.n_group = 1
+        cfg.route_scale = 1.0
+        cfg.moe_adaptive_routing = True
+        cfg.moe_route_top_p = 0.8
+        cfg.moe_min_experts = 1
+        cfg.moe_max_experts = 6
+        moe = DeepSeekMoE(cfg).to(self.device)
+        moe.eval()
+
+        torch.manual_seed(42)
+        x = torch.randn(32, cfg.dim, device=self.device)
+
+        # Call _adaptive_select via gate first to get router_probs
+        _w, _idx, z_loss, router_probs = moe.gate(x)
+        probs = router_probs.float()
+        sel, w = moe._adaptive_select(probs)
+
+        # Only check tokens that have at least one expert selected
+        active_mask = sel.any(dim=-1)
+        if active_mask.any():
+            active_w = w[active_mask]
+            # Sum of selected weights per token should be route_scale ± 1e-5
+            weight_sums = active_w.sum(dim=-1)
+            max_deviation = (weight_sums - cfg.route_scale).abs().max().item()
+            self.assertLess(
+                max_deviation, 1e-5,
+                f"Adaptive weights deviate from route_scale by {max_deviation:.2e}"
+            )
+
+    def test_122_expert_reachability_fixed_topk(self):
+        """Fixed top-k: every expert is reachable over a sufficient batch."""
+        from config import ModelArgs
+        from moe import Gate
+
+        cfg = ModelArgs()
+        cfg.dim = 64
+        cfg.n_routed_experts = 6
+        cfg.n_activated_experts = 2
+        cfg.n_group = 1
+        gate = Gate(0, cfg).to(self.device)
+        gate.eval()
+
+        # Use a large batch to give every expert a chance to be selected.
+        # With 6 experts and random weights, 128 tokens should be plenty.
+        torch.manual_seed(1234)
+        x = torch.randn(128, cfg.dim, device=self.device)
+        weights, indices, _, _ = gate(x)
+
+        activated = set(indices.unique().tolist())
+        expected = set(range(cfg.n_routed_experts))
+        missing = expected - activated
+        self.assertEqual(
+            len(missing), 0,
+            f"Experts {sorted(missing)} never activated over 128 tokens (fixed top-k)"
+        )
+
+    def test_123_expert_reachability_adaptive(self):
+        """Adaptive path: every expert is reachable over a sufficient batch."""
+        from config import ModelArgs
+        from moe import DeepSeekMoE
+
+        cfg = ModelArgs()
+        cfg.dim = 64
+        cfg.n_routed_experts = 6
+        cfg.n_activated_experts = 2
+        cfg.n_group = 1
+        cfg.moe_adaptive_routing = True
+        cfg.moe_route_top_p = 0.9  # generous top-p to allow more experts
+        cfg.moe_min_experts = 1
+        cfg.moe_max_experts = 6
+        moe = DeepSeekMoE(cfg).to(self.device)
+        moe.eval()
+
+        torch.manual_seed(1234)
+        x = torch.randn(128, cfg.dim, device=self.device)
+        _w, _idx, _, router_probs = moe.gate(x)
+        probs = router_probs.float()
+        sel, w = moe._adaptive_select(probs)
+
+        # Check which experts got selected at least once
+        activated = set(sel.any(dim=0).nonzero(as_tuple=True)[0].tolist())
+        expected = set(range(cfg.n_routed_experts))
+        missing = expected - activated
+        self.assertEqual(
+            len(missing), 0,
+            f"Experts {sorted(missing)} never activated over 128 tokens (adaptive)"
+        )
+
+    def test_124_tiny_config_exercises_fixed_topk(self):
+        """Tiny_Config (config_100m.json) exercises the fixed top-k routing mode."""
+        from config import ModelArgs
+        import json
+        from pathlib import Path
+
+        config_path = Path(__file__).resolve().parent.parent / "config_100m.json"
+        with open(config_path) as f:
+            raw = json.load(f)
+
+        # moe_adaptive_routing is not in config_100m.json → defaults to False
+        self.assertNotIn("moe_adaptive_routing", raw)
+
+        args = ModelArgs(**{k: v for k, v in raw.items() if hasattr(ModelArgs, k)})
+        self.assertFalse(
+            getattr(args, "moe_adaptive_routing", False),
+            "Tiny_Config should exercise the fixed top-k path (adaptive_routing=False)"
+        )
+        # Verify config params match design expectations
+        self.assertEqual(args.n_routed_experts, 6)
+        self.assertEqual(args.n_activated_experts, 2)
 
 
 if __name__ == "__main__":

@@ -52,7 +52,7 @@ VALID_TASKS = set(LASMOID_TASK_SP_TOKENS.keys())
 @dataclass(frozen=True)
 class TokenizerProfile:
     """Tokenizer contract expected by Lasmoid prompt encoding."""
-    vocab_size: int = 128000
+    vocab_size: int = 129286
     model_max_length: int = 1048576
     bos_token: str = bos_token
     eos_token: str = eos_token
@@ -81,6 +81,124 @@ class TokenizerProfile:
 
 
 LASMOID_TOKENIZER_PROFILE = TokenizerProfile()
+
+
+# ============================================================
+# Tokenizer Wrapper (encode/decode round-trip + id-range checks)
+# ============================================================
+
+class LasmoidTokenizer:
+    """Thin wrapper around PreTrainedTokenizerFast for encode/decode with id-range safety.
+
+    Provides:
+      - encode(text) → List[int]  with all ids in [0, vocab_size)
+      - decode(ids) → str
+      - batch_encode(texts) → List[List[int]]  with all ids validated
+      - roundtrip(text) → str  (encode then decode; should equal input for in-vocab text)
+    """
+
+    def __init__(self, tokenizer_dir: Optional[str] = None):
+        """Load the PreTrainedTokenizerFast from the given directory.
+
+        Args:
+            tokenizer_dir: Path to directory containing tokenizer.json and
+                tokenizer_config.json. Defaults to the Lasmoid project root
+                (two directories up from this file).
+        """
+        try:
+            import transformers
+        except ImportError as e:
+            raise ImportError(
+                "LasmoidTokenizer requires the `transformers` package. "
+                "Install with: pip install transformers"
+            ) from e
+
+        if tokenizer_dir is None:
+            import os
+            tokenizer_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        self._tok = transformers.PreTrainedTokenizerFast.from_pretrained(
+            tokenizer_dir, fix_mistral_regex=True
+        )
+        self._vocab_size = LASMOID_TOKENIZER_PROFILE.vocab_size
+
+    @property
+    def vocab_size(self) -> int:
+        """Configured vocabulary size."""
+        return self._vocab_size
+
+    def encode(self, text: str, *, add_special_tokens: bool = False) -> List[int]:
+        """Encode text to token ids, validating all ids are in [0, vocab_size).
+
+        Args:
+            text: Input text string.
+            add_special_tokens: Whether to prepend/append BOS/EOS tokens.
+
+        Returns:
+            List of token ids.
+
+        Raises:
+            ValueError: If any produced token id falls outside [0, vocab_size).
+        """
+        ids: List[int] = self._tok.encode(text, add_special_tokens=add_special_tokens)
+        self._validate_ids(ids)
+        return ids
+
+    def decode(self, ids: List[int], *, skip_special_tokens: bool = False) -> str:
+        """Decode token ids back to text.
+
+        Args:
+            ids: List of token ids.
+            skip_special_tokens: Whether to omit special tokens from output.
+
+        Returns:
+            Decoded text string.
+        """
+        return self._tok.decode(ids, skip_special_tokens=skip_special_tokens)
+
+    def batch_encode(
+        self, texts: List[str], *, add_special_tokens: bool = False
+    ) -> List[List[int]]:
+        """Encode a batch of texts, validating all ids are in [0, vocab_size).
+
+        Args:
+            texts: List of input text strings.
+            add_special_tokens: Whether to prepend/append BOS/EOS tokens.
+
+        Returns:
+            List of token id lists.
+
+        Raises:
+            ValueError: If any produced token id falls outside [0, vocab_size).
+        """
+        encoded = self._tok(
+            texts, add_special_tokens=add_special_tokens
+        )["input_ids"]
+        for ids in encoded:
+            self._validate_ids(ids)
+        return encoded
+
+    def roundtrip(self, text: str) -> str:
+        """Encode then decode text. For in-vocabulary text, should reproduce the input.
+
+        Args:
+            text: Input text string.
+
+        Returns:
+            The result of encode→decode.
+        """
+        ids = self.encode(text)
+        return self.decode(ids)
+
+    def _validate_ids(self, ids: List[int]) -> None:
+        """Raise ValueError if any id is outside [0, vocab_size)."""
+        for token_id in ids:
+            if token_id < 0 or token_id >= self._vocab_size:
+                raise ValueError(
+                    f"Token id {token_id} is outside the valid range "
+                    f"[0, {self._vocab_size}). This indicates a tokenizer/vocab mismatch."
+                )
+
 
 # ============================================================
 # Templates & Policies

@@ -43,7 +43,11 @@ class CheckpointManager:
         concept_db: Optional[torch.Tensor],
         memory_state: Optional[torch.Tensor],
     ):
-        """Saves current generation state (tokens, memory, and layer-level caches)."""
+        """Saves current generation state (tokens, memory, and layer-level caches).
+        
+        Validates that saved tensor shapes are consistent with the model's
+        current architecture before persisting.
+        """
         caches_state = {}
         for i, layer in enumerate(self.model.layers):
             layer_state = {}
@@ -81,7 +85,11 @@ class CheckpointManager:
             self.checkpoints.pop(0)
 
     def restore_latest(self) -> Optional[Tuple[int, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]]:
-        """Restores the latest saved checkpoint state into the model layers."""
+        """Restores the latest saved checkpoint state into the model layers.
+        
+        Verifies tensor shape consistency before restoring to prevent
+        silent corruption from architecture changes between save and restore.
+        """
         if not self.checkpoints:
             return None
         
@@ -91,16 +99,29 @@ class CheckpointManager:
             layer = self.model.layers[i]
             attn = layer.attn
             
-            # Restore buffers
+            # Restore buffers with shape validation
             for name, val in layer_state.get("buffers", {}).items():
                 if name in attn._buffers and isinstance(attn._buffers[name], torch.Tensor):
-                    attn._buffers[name].copy_(val)
+                    current_buf = attn._buffers[name]
+                    if current_buf.shape != val.shape:
+                        logger.warning(
+                            f"[recovery] Shape mismatch restoring buffer '{name}' in layer {i}: "
+                            f"checkpoint {tuple(val.shape)} vs model {tuple(current_buf.shape)}. Skipping."
+                        )
+                        continue
+                    current_buf.copy_(val)
 
-            # Restore attributes
+            # Restore attributes with shape validation
             for name, val in layer_state.get("attrs", {}).items():
                 if isinstance(val, torch.Tensor):
                     curr_val = getattr(attn, name, None)
                     if isinstance(curr_val, torch.Tensor):
+                        if curr_val.shape != val.shape:
+                            logger.warning(
+                                f"[recovery] Shape mismatch restoring attr '{name}' in layer {i}: "
+                                f"checkpoint {tuple(val.shape)} vs model {tuple(curr_val.shape)}. Skipping."
+                            )
+                            continue
                         curr_val.copy_(val)
                 else:
                     setattr(attn, name, val)

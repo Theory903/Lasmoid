@@ -69,6 +69,18 @@ class MoEConfig:
     # Dual dense+MoE FFW (Gemma-4 mlp2)
     moe_dual_ffn: bool = True
     expert_dtype: Literal["bf16", "fp8", "nvfp4"] = "bf16"
+    # ── Domain Cortex (brain-like sparse activation over scientific domains) ──
+    use_domain_cortex: bool = False
+    n_domains: int = 8
+    domain_topk: int = 2
+    cortex_load_balance_coeff: float = 0.01
+    cortex_route_noise: float = 1.0
+    # ── Adaptive (brain-like) variable-k expert recruitment ──
+    moe_adaptive_routing: bool = False
+    moe_route_top_p: float = 0.5
+    moe_min_experts: int = 1
+    moe_max_experts: int = 0
+    moe_adaptive_sparsity_coeff: float = 0.0
 
 
 @dataclass
@@ -103,15 +115,10 @@ class SSMConfig:
     dt_init_floor: float = 0.0001
     n_groups: int = 1
     d_skip: bool = True
-
-
-@dataclass
-class MHCConfig:
-    """Manifold Hyper-Connections."""
-
-    num_residual_streams: int = 4
-    sinkhorn_iters: int = 8
-    eps: float = 1e-6
+    is_mimo: bool = False
+    mimo_rank: int = 4
+    heavy_tail_alpha: float = 1.0
+    use_associative_scan: bool = False  # Gate: true chunked associative scan
 
 
 @dataclass
@@ -130,6 +137,7 @@ class ConceptMemoryConfig:
     concept_topk: int = 8
     concept_ratio: float = 0.4
     predictive_coding_coeff: float = 0.01
+    perceiver_n_heads: int = 8  # Number of attention heads for perceiver pooling
 
 
 @dataclass
@@ -266,6 +274,42 @@ class ModelArgs:
     moe_dual_ffn: bool = True
     swiglu_limit: float = 10.0
 
+    # ── Domain Cortex (brain-like sparse activation over scientific domains) ──
+    use_domain_cortex: bool = False
+    n_domains: int = 8
+    domain_topk: int = 2
+    cortex_load_balance_coeff: float = 0.01
+    cortex_route_noise: float = 1.0
+    # ── Adaptive (brain-like) variable-k expert recruitment ──
+    moe_adaptive_routing: bool = False
+    moe_route_top_p: float = 0.5
+    moe_min_experts: int = 1
+    moe_max_experts: int = 0  # 0 → use n_activated_experts as the cap
+    moe_adaptive_sparsity_coeff: float = 0.0
+    domain_names: List[str] = field(
+        default_factory=lambda: [
+            "general",
+            "mathematics",
+            "physics",
+            "chemistry",
+            "biology_medical",
+            "astronomy",
+            "computer_science",
+            "data_analysis",
+        ]
+    )
+
+    # ── Relational Cortex (AlphaFold-3 Evoformer-style pairwise reasoning) ──
+    use_relational_cortex: bool = False
+    relational_pair_dim: int = 16
+    relational_opm_chan: int = 4
+    relational_iters: int = 2
+
+    # ── Curiosity Expert (intrinsic-curiosity questioning / concept bridging) ──
+    use_curiosity_expert: bool = False
+    curiosity_n_questions: int = 4
+    curiosity_coeff: float = 0.01
+
     # ── Quantization ──
     quant_config: QuantConfig = field(default_factory=QuantConfig)
     use_mxfp4_weights: bool = False
@@ -281,6 +325,10 @@ class ModelArgs:
     ssm_dt_init_floor: float = 0.0001
     ssm_n_groups: int = 1
     ssm_d_skip: bool = True
+    ssm_is_mimo: bool = False
+    ssm_mimo_rank: int = 4
+    ssm_heavy_tail_alpha: float = 1.0
+    use_associative_scan: bool = False  # Gate: true chunked associative scan (default = sequential)
 
     # ── HC ──
     num_residual_streams: int = 4
@@ -298,6 +346,10 @@ class ModelArgs:
     entropy_threshold: float = 0.5
     lightning_topk_blocks: int = 4
     ema_bias_lr: float = 0.01
+    perceiver_n_heads: int = 8  # Number of attention heads for perceiver pooling
+
+    # ── Graph Vector Quantization (GVQ) ──
+    use_gvq: bool = False  # Gate: enable GVQ graph message-passing on codebook embeddings
 
     # ── Hybrid Concept Attention ──
     concept_topk: int = 8
@@ -306,6 +358,15 @@ class ModelArgs:
 
     # ── MTP ──
     n_mtp_layers: int = 1
+    mtp_speculation_enabled: bool = False
+    mtp_draft_length: int = 6
+    mtp_shared_weights: bool = True
+    mtp_fused_norm: bool = False  # True = spec-correct post-fusion RMSNorm per ARCHITECTURE.md
+    mtp_loss_coeff: float = 0.3  # Weight for MTP auxiliary CE loss in aggregate
+
+    # ── Loss Aggregation ──
+    moe_aux_coeff: float = 1.0  # Weight for the combined MoE auxiliary loss term
+    loss_ignore_index: int = -100  # Index to ignore in primary CE (padding)
 
     # ── Einsum Parameterization (Gemma-4) ──
     use_einsum: bool = False
@@ -364,9 +425,11 @@ class ModelArgs:
     use_block_attnres: bool = False
     block_attnres_block_size: int = 16
     block_attnres_n_blocks: int = 4
+    attnres_gate_type: Literal["alpha", "scalar", "vector", "none"] = "alpha"
 
     # ── Ring Attention ──
     use_ring_attention: bool = False
+    ring_wraparound_fix: bool = False  # Gate: enable remainder-token handling in distributed ring prefill
 
     # ── Stability ──
     stability_enabled: bool = False
@@ -464,14 +527,10 @@ class ModelArgs:
             dt_init_floor=self.ssm_dt_init_floor,
             n_groups=self.ssm_n_groups,
             d_skip=self.ssm_d_skip,
-        )
-
-    @property
-    def mhc_config(self) -> MHCConfig:
-        return MHCConfig(
-            num_residual_streams=self.num_residual_streams,
-            sinkhorn_iters=self.hc_sinkhorn_iters,
-            eps=self.hc_eps,
+            is_mimo=getattr(self, "ssm_is_mimo", False),
+            mimo_rank=getattr(self, "ssm_mimo_rank", 4),
+            heavy_tail_alpha=getattr(self, "ssm_heavy_tail_alpha", 1.0),
+            use_associative_scan=getattr(self, "use_associative_scan", False),
         )
 
     @property
