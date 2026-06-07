@@ -25,6 +25,7 @@ from pathlib import Path
 # Helper
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def cell(source: str, cell_type: str = "code", metadata: dict = None) -> dict:
     src = textwrap.dedent(source).lstrip("\n")
     if cell_type == "markdown":
@@ -43,17 +44,23 @@ cells = []
 # ─────────────────────────────────────────────────────────────────────────────
 # TITLE
 # ─────────────────────────────────────────────────────────────────────────────
-cells.append(cell("""
+cells.append(
+    cell(
+        """
 # Lasmoid 12M Frontier — Kaggle Training
 ### 3-Phase Curriculum · Qwen3.5-0.8B Distillation · Frontier Eval Harness
 *35K Steps · Seq Len 1024 · WSD Schedule · Dual T4*
-""", "markdown"))
+""",
+        "markdown",
+    )
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S1 — ENVIRONMENT
 # ═════════════════════════════════════════════════════════════════════════════
 cells.append(cell("## Section 1 — Environment Setup", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 !pip install -q uv
 !uv pip install --system -q \\
     git+https://github.com/huggingface/transformers.git \\
@@ -75,13 +82,15 @@ import transformers
 print(f"Transformers : {transformers.__version__}")
 print(f"PyTorch      : {torch.__version__}")
 print("✅ Environment ready")
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S2 — GPU DETECTION
 # ═════════════════════════════════════════════════════════════════════════════
 cells.append(cell("## Section 2 — GPU Detection", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 def gpu_info():
     if not torch.cuda.is_available():
         return {"n_gpus": 0, "total_vram_gb": 0, "names": [], "vram_per": []}
@@ -101,13 +110,15 @@ if GPU["n_gpus"] == 0:
 DTYPE = torch.bfloat16
 print(f"Compute dtype : {DTYPE}")
 print(f"Total VRAM    : {GPU['total_vram_gb']:.1f} GB")
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S3 — ACCELERATE
 # ═════════════════════════════════════════════════════════════════════════════
 cells.append(cell("## Section 3 — Accelerate Multi-GPU Setup (DDP)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 from accelerate import Accelerator, DistributedDataParallelKwargs
 
 ddp_kwargs  = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -132,13 +143,15 @@ random.seed(SEED)
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S4a — PATHS & HF TOKEN
 # ═════════════════════════════════════════════════════════════════════════════
 cells.append(cell("## Section 4a — Paths, HF Token, Config", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 import os
 from pathlib import Path
 
@@ -176,13 +189,15 @@ sys.path.insert(0, str(REPO_DIR / "train"))
 
 print(f"Repo : {REPO_DIR}")
 print(f"CKPTs: {CKPT_DIR}")
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S4b — GRACEFUL SHUTDOWN
 # ═════════════════════════════════════════════════════════════════════════════
 cells.append(cell("## Section 4b — Graceful Shutdown Handler", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 import signal
 
 _CHECKPOINT_ON_KILL = {"step": 0, "dataset_idx": 0, "phase": "phase1"}
@@ -214,13 +229,15 @@ def _shutdown_handler(signum, frame):
 signal.signal(signal.SIGTERM, _shutdown_handler)
 signal.signal(signal.SIGINT,  _shutdown_handler)
 print("✅ Graceful shutdown handler registered (SIGTERM / SIGINT)")
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S4c — TOKENIZER
 # ═════════════════════════════════════════════════════════════════════════════
 cells.append(cell("## Section 4c — Tokenizer (Lasmodium BPE, 32768 vocab)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 from transformers import AutoTokenizer
 
 TOK_PATH  = str(REPO_DIR)
@@ -249,13 +266,15 @@ if missing:
 for tok in CONCEPT_SPECIAL_TOKENS:
     print(f"  {tok:>15} → id={tokenizer.convert_tokens_to_ids(tok)}")
 print("✅ Tokenizer ready")
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S5 — STREAMING DATASETS + 3-PHASE CURRICULUM
 # ═════════════════════════════════════════════════════════════════════════════
 cells.append(cell("## Section 5 — Streaming Datasets + 3-Phase Curriculum", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 from datasets import load_dataset, interleave_datasets
 
 # ── Hyperparameters ──────────────────────────────────────────────────────────
@@ -389,13 +408,15 @@ print(f"✅ Datasets ready  SEQ_LEN={SEQ_LEN}  BATCH={BATCH_SIZE}  "
       f"MAX_STEPS={MAX_STEPS}  CKPT_EVERY={CKPT_EVERY}")
 print(f"   Phase boundaries: {PHASE_BOUNDARIES}")
 print(f"   Frontier eval   : every {EVAL_EVERY} steps")
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S6 — MODEL CONSTRUCTION
 # ═════════════════════════════════════════════════════════════════════════════
 cells.append(cell("## Section 6 — Lasmoid Model Construction (~12M)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 import json, sys, functools
 
 sys.path.insert(0, str(REPO_DIR / "inference"))
@@ -476,13 +497,17 @@ print(f"  Concepts        : {cfg.get('num_concepts')} "
       f"(codebook={cfg.get('codebook_size')})")
 print(f"  VRAM estimate   : ~{train_params*4/1e9:.1f} GB (params+grads, bf16)")
 print("=" * 60)
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S7 — MUON + ADAMW + WSD
 # ═════════════════════════════════════════════════════════════════════════════
-cells.append(cell("## Section 7 — Muon + AdamW Dual Optimizer & WSD Scheduler", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("## Section 7 — Muon + AdamW Dual Optimizer & WSD Scheduler", "markdown")
+)
+cells.append(
+    cell("""
 sys.path.insert(0, str(REPO_DIR / "train"))
 
 from optimizer import build_optimizers, clip_grad_global_norm, ensure_muon_closure_compat, Muon
@@ -524,16 +549,19 @@ scheduler = WSDScheduler(
 
 print(f"WSD: warmup={warmup_steps}  stable={stable_steps}  decay={decay_steps}")
 print(f"Muon LR: {MUON_LR}    AdamW LR: {ADAMW_LR}")
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S8 — TEACHER MODEL
 # ═════════════════════════════════════════════════════════════════════════════
 cells.append(cell("## Section 8 — Teacher: Qwen3.5-0.8B (4-bit NF4)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 from transformers import BitsAndBytesConfig, AutoModelForCausalLM, AutoTokenizer as HFTok
 
 TEACHER_MODEL = "Qwen/Qwen3.5-0.8B"
+TEACHER_EVERY = 32  # Only run teacher forward every 32 steps
 
 bnb_cfg = BitsAndBytesConfig(
     load_in_4bit              = True,
@@ -575,13 +603,20 @@ TEACHER_VOCAB = teacher_tok.vocab_size
 
 print(f"✅ Teacher loaded: {sum(p.numel() for p in teacher.parameters())/1e6:.1f}M params")
 print(f"   Teacher vocab: {TEACHER_VOCAB:,}    Lasmoid vocab: {VOCAB_SIZE:,}")
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S9 — DISTILLATION LOSS
 # ═════════════════════════════════════════════════════════════════════════════
-cells.append(cell("## Section 9 — Distillation Loss (Top-K Sparse KL + Temperature Annealing)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell(
+        "## Section 9 — Distillation Loss (Top-K Sparse KL + Temperature Annealing)",
+        "markdown",
+    )
+)
+cells.append(
+    cell("""
 import torch.nn.functional as F
 
 DISTILL_TOP_K = 4096
@@ -631,13 +666,15 @@ print("✅ Distillation loss ready")
 print(f"   Top-K sparse KL  : K={DISTILL_TOP_K}")
 print(f"   Temperature       : {T_START} → {T_END} (cosine)")
 print(f"   Alpha schedule    : {ALPHA_WARMUP} → {ALPHA_PEAK} → {ALPHA_FINAL}")
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S10 — EXPERT & CONCEPT MONITORING (with routing entropy)
 # ═════════════════════════════════════════════════════════════════════════════
 cells.append(cell("## Section 10 — Expert & Concept Monitoring", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 class ExpertMonitor:
     \"\"\"MoE utilization + routing entropy + Gini coefficient.\"\"\"
 
@@ -744,13 +781,15 @@ print(f"✅ Expert monitor  : {args.n_layers} layers × {args.n_routed_experts} 
 print(f"✅ Concept monitor : {args.num_concepts} concepts")
 print(f"   Routing entropy tracked  : yes")
 print(f"   Concept collapse guard   : top5 > 80%")
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S11 — CHECKPOINT SYSTEM
 # ═════════════════════════════════════════════════════════════════════════════
 cells.append(cell("## Section 11 — Crash-Safe Checkpoint System", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 from safetensors.torch import save_file as safetensors_save
 
 CURSOR_FILE     = CKPT_DIR / "cursor.json"
@@ -881,13 +920,15 @@ def load_checkpoint(model, optimizers, scheduler, ckpt_path: Path):
 
 print(f"✅ Checkpoint system ready  (every {CKPT_EVERY} steps)")
 print(f"   Best-model tracking: {BEST_SCORE_FILE.name}")
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S12 — OOM RECOVERY + ACCELERATE WRAP
 # ═════════════════════════════════════════════════════════════════════════════
 cells.append(cell("## Section 12 — OOM Recovery + Accelerate Wrap", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 import gc
 
 model, *optimizers = accelerator.prepare(model, *optimizers)
@@ -911,13 +952,15 @@ def safe_forward(model, x_enc, x_dec):
 
 print("✅ Model wrapped with Accelerate (DDP + bf16)")
 print(f"   Model on: {next(model.parameters()).device}")
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S13 — AUTO-RESUME
 # ═════════════════════════════════════════════════════════════════════════════
 cells.append(cell("## Section 13 — Auto-Resume", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 loss_history  = []
 expert_stats  = {}
 concept_stats = {}
@@ -943,13 +986,15 @@ if N_PROC > 1:
     t = torch.tensor([START_STEP], dtype=torch.long, device=DEVICE)
     torch.distributed.broadcast(t, src=0)
     START_STEP = t.item()
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S14 — FRONTIER EVALUATION HARNESS
 # ═════════════════════════════════════════════════════════════════════════════
 cells.append(cell("## Section 14 — Frontier Evaluation Harness", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 # ─────────────────────────────────────────────────────────────────────────────
 # Fixed prompts covering: arithmetic, reasoning, language, coding, concept-mem
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1202,13 +1247,15 @@ print("✅ Frontier Evaluation Harness ready")
 print(f"   Eval prompts   : {len(EVAL_PROMPTS)}")
 print(f"   Eval frequency : every {EVAL_EVERY} steps")
 print(f"   Arena runs     : every {EVAL_EVERY * 5} steps")
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S15 — TRAINING LOOP (35K steps, phase-aware, with eval + arena)
 # ═════════════════════════════════════════════════════════════════════════════
 cells.append(cell("## Section 15 — Training Loop (35K Steps, Phase-Aware)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 from tqdm.auto import tqdm
 
 loss_log_path = LOG_DIR / "loss.jsonl"
@@ -1301,7 +1348,8 @@ for step in pbar:
                 alpha = get_distill_alpha(step, MAX_STEPS)
 
                 kl_loss = torch.zeros((), device=DEVICE)
-                if alpha > 0.01:
+                run_teacher = alpha > 0.01 and step % TEACHER_EVERY == 0
+                if run_teacher:
                     teacher_logits = compute_teacher_logits(teacher, x, VOCAB_SIZE)
                     kl_loss = sparse_kl_distillation_loss(
                         logits, teacher_logits, temperature=T, top_k=DISTILL_TOP_K
@@ -1497,13 +1545,17 @@ for step in pbar:
             concept_monitor.reset()
 
 print("\\n✅ Training complete!")
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S16 — VALIDATION
 # ═════════════════════════════════════════════════════════════════════════════
-cells.append(cell("## Section 16 — Validation (Perplexity + Reasoning Probe)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("## Section 16 — Validation (Perplexity + Reasoning Probe)", "markdown")
+)
+cells.append(
+    cell("""
 model.eval()
 
 val_path = REPO_DIR / "datasets" / "tinystories_val.bin"
@@ -1541,13 +1593,17 @@ print_scorecard(MAX_STEPS, loss_history[-1] if loss_history else 0.0,
                 expert_monitor.stats(), concept_monitor.stats(), final_eval)
 
 model.train()
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S17 — TRAINING REPORT
 # ═════════════════════════════════════════════════════════════════════════════
-cells.append(cell("## Section 17 — Training Report (Loss Curves + Eval Scores)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("## Section 17 — Training Report (Loss Curves + Eval Scores)", "markdown")
+)
+cells.append(
+    cell("""
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -1641,13 +1697,19 @@ if losses:
     print(f"  Concept entropy  : {concept_ent[-1]:.3f}" if concept_ent else "")
     print(f"  Total tokens     : {total_tokens_seen:,}")
     print(f"{'='*60}")
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S18 — KAGGLE EXPORT
 # ═════════════════════════════════════════════════════════════════════════════
-cells.append(cell("## Section 18 — Kaggle Dataset Export (Multi-Session Persistence)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell(
+        "## Section 18 — Kaggle Dataset Export (Multi-Session Persistence)", "markdown"
+    )
+)
+cells.append(
+    cell("""
 import shutil
 
 def export_for_kaggle(step: int, model, export_dir: Path):
@@ -1703,13 +1765,17 @@ def export_for_kaggle(step: int, model, export_dir: Path):
 if IS_MAIN and loss_history:
     final_step = len(loss_history) + START_STEP
     export_for_kaggle(final_step, model, EXPORT_DIR)
-"""))
+""")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # S19 — HUGGINGFACE EXPORT
 # ═════════════════════════════════════════════════════════════════════════════
-cells.append(cell("## Section 19 — Final Export (SafeTensors + HuggingFace Hub)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("## Section 19 — Final Export (SafeTensors + HuggingFace Hub)", "markdown")
+)
+cells.append(
+    cell("""
 import shutil
 from safetensors.torch import save_file as sf_save
 
@@ -1785,7 +1851,8 @@ Best-model checkpoint saved automatically based on overall eval score.
 
     print(f"✅ Model ready at: {hf_dir}")
     print(f"   Best eval score : {best_score:.4f}  (step {best_step_val})")
-"""))
+""")
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BUILD NOTEBOOK JSON
@@ -1812,7 +1879,7 @@ notebook = {
     "cells": cells,
 }
 
-OUT_DIR  = Path(__file__).parent.parent / "notebooks" / "distillation"
+OUT_DIR = Path(__file__).parent.parent / "notebooks" / "distillation"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 out_path = OUT_DIR / "lasmoid_12m_frontier.ipynb"
 
