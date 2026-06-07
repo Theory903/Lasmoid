@@ -422,7 +422,7 @@ cells.append(
 )
 cells.append(
     cell("""
-import json, sys
+import json, sys, functools
 from pathlib import Path
 
 sys.path.insert(0, str(REPO_DIR / "inference"))
@@ -453,6 +453,32 @@ try:
 except Exception:
     pass
 del _cp
+
+# ── Gradient checkpoint reentrant crash guard ──────────────────────────────
+# The remote repo's lasmoid.py uses use_reentrant=True for per-layer gradient
+# checkpointing (line 591). When checkpoint outputs (streams, z_loss, vq_loss,
+# event_prob) are used in MULTIPLE loss paths (CE + KL distillation + VQ +
+# CIF boundary regulariser), the reentrant checkpoint backward replays forward
+# but frees recomputed intermediates after the first gradient pass through
+# each shared output — causing:
+#
+#   RuntimeError: Trying to backward through the graph a second time
+#   torch/utils/checkpoint.py:325  autograd.backward(outputs_with_grad, ...)
+#
+# Fix: force use_reentrant=False, which saves intermediates during forward
+# instead of recomputing. This trades ~15-20% additional VRAM for correct
+# multi-loss backward graphs.  This is the PyTorch 2.x recommended default.
+import torch.utils.checkpoint as _cp_ckpt
+_orig_ckpt_fn = _cp_ckpt.checkpoint
+if not getattr(_cp_ckpt.checkpoint, '__reentrant_patched', False):
+    @functools.wraps(_orig_ckpt_fn)
+    def _safe_ckpt_fn(function, *args, **kwargs):
+        kwargs['use_reentrant'] = False
+        return _orig_ckpt_fn(function, *args, **kwargs)
+    _cp_ckpt.checkpoint = _safe_ckpt_fn
+    _cp_ckpt.checkpoint.__reentrant_patched = True
+print("✅ Gradient checkpoint patched: use_reentrant=False (multi-loss safe)")
+del _cp_ckpt
 
 # Load base 100M config
 cfg_path = REPO_DIR / "configs" / "model" / "config_gemma4_100m.json"
