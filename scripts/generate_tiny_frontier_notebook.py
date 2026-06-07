@@ -480,6 +480,8 @@ def stream_packed(dataset, tokenizer, seq_len: int,
     buf = []
     count = 0
     eos_id = tokenizer.eos_token_id
+    if eos_id is None:
+        eos_id = getattr(tokenizer, "sep_token_id", None) or getattr(tokenizer, "pad_token_id", 1)
     for example in dataset:
         text = clean_text(example.get("text", "") or example.get("content", ""))
         if len(text) < MIN_CHARS or len(text) > MAX_CHARS:
