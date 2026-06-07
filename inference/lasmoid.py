@@ -503,7 +503,7 @@ class Lasmoid(nn.Module):
                             domain_steer,
                             r_step,
                             use_reentrant=False,
-                            debug=True,
+                            debug=False,
                         )
                     )
                 else:
