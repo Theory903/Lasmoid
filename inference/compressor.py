@@ -220,7 +220,7 @@ class Compressor(nn.Module):
             torch.zeros(max_batch_size_comp, cache_cap, dtype=torch.long),
             persistent=False,
         )
-        self._saved_num_fires = None
+        self._saved_num_fires = {}
 
     def resize_buffers(self, bsz: int, device: Optional[torch.device] = None):
         if bsz > self.kv_accumulator.shape[0]:
@@ -254,9 +254,9 @@ class Compressor(nn.Module):
             )
 
     def clear_saved_checkpoint_state(self):
-        self._saved_num_fires = None
+        self._saved_num_fires = {}
 
-    def forward(self, x: torch.Tensor, start_pos: int):
+    def forward(self, x: torch.Tensor, start_pos: int, r_step: int = 0):
         assert self.kv_cache is not None
         bsz, seqlen, _ = x.size()
         self.resize_buffers(bsz, device=x.device)
@@ -327,12 +327,12 @@ class Compressor(nn.Module):
             # Always run the dynamic maximum fire calculation to build the exact same autograd graph in both passes
             num_complete_fires_dyn = max(1, int(num_complete_fires_per_sample.max().item()))
             if self.training:
-                if self._saved_num_fires is None:
-                    self._saved_num_fires = num_complete_fires_dyn
-                num_complete_fires = self._saved_num_fires
+                if r_step not in self._saved_num_fires:
+                    self._saved_num_fires[r_step] = num_complete_fires_dyn
+                num_complete_fires = self._saved_num_fires[r_step]
             else:
                 num_complete_fires = num_complete_fires_dyn
-            print(f"[Compressor DEBUG] training={self.training}, saved={self._saved_num_fires}, dyn={num_complete_fires_dyn}, selected={num_complete_fires}")
+            print(f"[Compressor DEBUG] training={self.training}, r_step={r_step}, saved={self._saved_num_fires}, dyn={num_complete_fires_dyn}, selected={num_complete_fires}")
 
             # 6. Scatter-add alpha-weighted KV and gate into fire buckets
             fire_idx = fire_bucket.expand(-1, -1, d)  # [B, S, D]

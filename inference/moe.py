@@ -104,7 +104,7 @@ class Gate(nn.Module):
                 torch.zeros(args.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
-        self._saved_indices = None
+        self._saved_indices = {}
 
     def apply_pending_updates(self):
         if self.bias is not None and self.pending_bias_updates:
@@ -114,13 +114,14 @@ class Gate(nn.Module):
             self.pending_bias_updates.clear()
 
     def clear_saved_checkpoint_state(self):
-        self._saved_indices = None
+        self._saved_indices = {}
 
     def forward(
         self,
         x: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
         domain_steer: Optional[torch.Tensor] = None,
+        r_step: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute expert routing scores and select top-k experts.
 
@@ -230,9 +231,9 @@ class Gate(nn.Module):
                 indices_dyn = scores_for_choice.topk(self.topk, dim=-1)[1]
 
         if self.training:
-            if self._saved_indices is None:
-                self._saved_indices = indices_dyn
-            indices = self._saved_indices
+            if r_step not in self._saved_indices:
+                self._saved_indices[r_step] = indices_dyn
+            indices = self._saved_indices[r_step]
         else:
             indices = indices_dyn
 
@@ -354,13 +355,13 @@ class DeepSeekMoE(nn.Module):
         self.last_capacity_overflow = torch.tensor(0.0)
         self.last_router_entropy = torch.tensor(0.0)
         self.last_avg_experts = torch.tensor(float(self.n_activated))
-        self._saved_sel = None
-        self._saved_w = None
+        self._saved_sel = {}
+        self._saved_w = {}
 
     def clear_saved_checkpoint_state(self):
         self.gate.clear_saved_checkpoint_state()
-        self._saved_sel = None
-        self._saved_w = None
+        self._saved_sel = {}
+        self._saved_w = {}
 
     def _adaptive_select(self, probs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Top-p (nucleus) variable-k expert selection per token.
@@ -398,13 +399,13 @@ class DeepSeekMoE(nn.Module):
         return sel, w
 
     def _adaptive_forward(
-        self, x: torch.Tensor, domain_steer: Optional[torch.Tensor] = None
+        self, x: torch.Tensor, domain_steer: Optional[torch.Tensor] = None, r_step: int = 0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         shape = x.shape
         flat_x = x.reshape(-1, self.dim)
         N_tokens = flat_x.shape[0]
 
-        _w, _idx, z_loss, router_probs = self.gate(flat_x, None, domain_steer=domain_steer)
+        _w, _idx, z_loss, router_probs = self.gate(flat_x, None, domain_steer=domain_steer, r_step=r_step)
         probs = router_probs.float()
         if self.gate.last_expert_mask is not None:
             probs = probs.masked_fill(~self.gate.last_expert_mask, 0.0)
@@ -413,10 +414,10 @@ class DeepSeekMoE(nn.Module):
         sel_dyn, w_dyn = self._adaptive_select(probs)
 
         if self.training:
-            if self._saved_sel is None:
-                self._saved_sel = sel_dyn
-            sel = self._saved_sel
-            print(f"[MoE DEBUG] training={self.training}, sel_dyn sum={sel_dyn.sum().item()}, saved_sel sum={self._saved_sel.sum().item()}")
+            if r_step not in self._saved_sel:
+                self._saved_sel[r_step] = sel_dyn
+            sel = self._saved_sel[r_step]
+            print(f"[MoE DEBUG] training={self.training}, r_step={r_step}, sel_dyn sum={sel_dyn.sum().item()}, saved_sel sum={sel.sum().item()}")
             # Since sel is boolean, we compute w dynamically from probs and sel.
             # This ensures that:
             # 1. w matches the saved shape and content from the forward pass.
@@ -511,15 +512,15 @@ class DeepSeekMoE(nn.Module):
         return y.reshape(shape), aux
 
     def forward(
-        self, x: torch.Tensor, domain_steer: Optional[torch.Tensor] = None
+        self, x: torch.Tensor, domain_steer: Optional[torch.Tensor] = None, r_step: int = 0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.adaptive_routing:
-            return self._adaptive_forward(x, domain_steer)
+            return self._adaptive_forward(x, domain_steer, r_step=r_step)
         shape = x.shape
         flat_x = x.reshape(-1, self.dim)
         N_tokens = flat_x.shape[0]
 
-        weights, indices, z_loss, router_probs = self.gate(flat_x, None, domain_steer=domain_steer)
+        weights, indices, z_loss, router_probs = self.gate(flat_x, None, domain_steer=domain_steer, r_step=r_step)
 
         # ── Expert capacity: max tokens each expert can receive ──────
         # capacity = ceil(capacity_factor * tokens / n_experts * n_activated)

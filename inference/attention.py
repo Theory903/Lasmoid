@@ -272,6 +272,7 @@ class MLAAttention(Attention):
         start_pos: int = 0,
         concept_db: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
         B, N, _ = x.shape
         win = self.kv_cache.shape[1]
@@ -527,7 +528,7 @@ class CSAAttention(Attention):
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int):
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int, r_step: int = 0, **kwargs):
         bsz, seqlen, _ = x.size()
         freqs_cis_layer = self.freqs_cis[start_pos : start_pos + seqlen]
         win = self.window_size
@@ -591,7 +592,7 @@ class CSAAttention(Attention):
                     :, -win:
                 ].split([win - cutoff, cutoff], dim=1)
             if self.compress_ratio:
-                compressor_out = self.compressor(x, start_pos)
+                compressor_out = self.compressor(x, start_pos, r_step=r_step)
                 if compressor_out is not None:
                     if isinstance(compressor_out, tuple):
                         kv_compress, event_prob = compressor_out
@@ -652,7 +653,7 @@ class CSAAttention(Attention):
                 self.kv_cache[:bsz, write_start:win] = kv[:, :part1_len]
                 self.kv_cache[:bsz, 0:part2_len] = kv[:, part1_len:]
             if self.compress_ratio:
-                self.compressor(x, start_pos)
+                self.compressor(x, start_pos, r_step=r_step)
 
             topk_idxs = torch.clamp(topk_idxs, min=-1, max=self.kv_cache.size(1) - 1)
             o = sparse_attn(
@@ -800,7 +801,7 @@ class HCAAttention(Attention):
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int):
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int, r_step: int = 0, **kwargs):
         bsz, seqlen, _ = x.size()
         freqs_cis_layer = self.freqs_cis[start_pos : start_pos + seqlen]
         win = self.window_size
@@ -860,7 +861,7 @@ class HCAAttention(Attention):
                     :, -win:
                 ].split([win - cutoff, cutoff], dim=1)
             if self.compress_ratio:
-                compressor_out = self.compressor(x, start_pos)
+                compressor_out = self.compressor(x, start_pos, r_step=r_step)
                 if compressor_out is not None:
                     if isinstance(compressor_out, tuple):
                         kv_compress, event_prob = compressor_out
@@ -917,7 +918,7 @@ class HCAAttention(Attention):
                 self.kv_cache[:bsz, write_start:win] = kv[:, :part1_len]
                 self.kv_cache[:bsz, 0:part2_len] = kv[:, part1_len:]
             if self.compress_ratio:
-                self.compressor(x, start_pos)
+                self.compressor(x, start_pos, r_step=r_step)
 
             topk_idxs = torch.clamp(topk_idxs, min=-1, max=self.kv_cache.size(1) - 1)
             o = sparse_attn(

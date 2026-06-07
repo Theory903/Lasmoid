@@ -501,6 +501,7 @@ class Lasmoid(nn.Module):
                             x_dec,
                             layer_feats_slice,
                             domain_steer,
+                            r_step,
                             use_reentrant=False,
                             debug=True,
                         )
@@ -513,6 +514,7 @@ class Lasmoid(nn.Module):
                         x_dec,
                         layer_feats=layer_feats_slice,
                         domain_steer=domain_steer,
+                        r_step=r_step,
                     )
 
                 if r_step == reasoning_steps - 1:

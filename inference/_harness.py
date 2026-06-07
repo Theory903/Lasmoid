@@ -318,7 +318,7 @@ def ref_parity(
 # Fixtures
 # ---------------------------------------------------------------------------
 
-_CONFIG_PATH = _PROJECT_ROOT / "config_100m.json"
+_CONFIG_PATH = _PROJECT_ROOT / "configs" / "model" / "config_100m.json"
 
 
 def tiny_config() -> "ModelArgs":

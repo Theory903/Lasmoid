@@ -92,6 +92,7 @@ class LasmoidBlock(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         layer_feats: Optional[torch.Tensor] = None,
         domain_steer: Optional[torch.Tensor] = None,
+        r_step: int = 0,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -119,7 +120,7 @@ class LasmoidBlock(nn.Module):
         normed_in = self.attn_norm(attn_in_flat)
 
         # Run Attention path
-        attn_out_flat = self.attn(normed_in, freqs_cis, start_pos)
+        attn_out_flat = self.attn(normed_in, freqs_cis, start_pos, r_step=r_step)
 
         # Run Parallel SSM Recurrence path
         ssm_out_flat = self.ssm_branch(normed_in, start_pos)
@@ -143,7 +144,7 @@ class LasmoidBlock(nn.Module):
         B_f, S_f, H_f, D_f = ffn_in.shape
         ffn_in_flat = ffn_in.transpose(1, 2).reshape(B_f * H_f, S_f, D_f)
 
-        ffn_out_flat, z_loss = self.moe_layer(self.ffn_norm(ffn_in_flat), domain_steer=domain_steer)
+        ffn_out_flat, z_loss = self.moe_layer(self.ffn_norm(ffn_in_flat), domain_steer=domain_steer, r_step=r_step)
 
         if self.use_post_ffw_norm:
             ffn_out_flat = self.post_ffw_norm(ffn_out_flat)

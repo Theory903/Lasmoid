@@ -27,7 +27,7 @@ from attention import precompute_freqs_cis
 
 
 def load_tiny_config():
-    cfg_path = Path(__file__).resolve().parent.parent / "config_100m.json"
+    cfg_path = Path(__file__).resolve().parent.parent / "configs" / "model" / "config_100m.json"
     with open(cfg_path) as f:
         cfg = json.load(f)
     return ModelArgs(**cfg)
