@@ -248,15 +248,20 @@ class StateSpaceRecurrence(nn.Module):
             # Low-rank residual channel-mixing on the SSM input (v) and output (y),
             # applied per head across d_head.  Output factor initialised to zero so
             # the projections are an exact identity (no-op) at initialisation.
-            self.mimo_x_down = nn.Parameter(torch.randn(self.n_heads, self.d_head, R) * 0.02)
+            self.mimo_x_down = nn.Parameter(
+                torch.randn(self.n_heads, self.d_head, R) * 0.02
+            )
             self.mimo_x_up = nn.Parameter(torch.zeros(self.n_heads, R, self.d_head))
-            self.mimo_o_down = nn.Parameter(torch.randn(self.n_heads, self.d_head, R) * 0.02)
+            self.mimo_o_down = nn.Parameter(
+                torch.randn(self.n_heads, self.d_head, R) * 0.02
+            )
             self.mimo_o_up = nn.Parameter(torch.zeros(self.n_heads, R, self.d_head))
 
             # SSM RoPE applied to the B/C state matrices (d_state must be even).
-            self.use_ssm_rope = (self.d_state % 2 == 0)
+            self.use_ssm_rope = self.d_state % 2 == 0
             if self.use_ssm_rope:
                 from functools import lru_cache  # noqa: F401
+
                 try:
                     from .attention import precompute_freqs_cis as _pf
                 except ImportError:
@@ -264,7 +269,9 @@ class StateSpaceRecurrence(nn.Module):
                 rope_len = min(args.max_seq_len + 1024, 2097152 + 1024)
                 self.register_buffer(
                     "ssm_freqs_cis",
-                    _pf(self.d_state, rope_len, 0, getattr(args, "rope_theta", 10000.0)),
+                    _pf(
+                        self.d_state, rope_len, 0, getattr(args, "rope_theta", 10000.0)
+                    ),
                     persistent=False,
                 )
         else:
@@ -272,7 +279,9 @@ class StateSpaceRecurrence(nn.Module):
 
     def _apply_mimo_in(self, v_heads: torch.Tensor) -> torch.Tensor:
         # v_heads: (B, S, H, d_head)  →  residual low-rank channel mix per head
-        mix = torch.einsum("bshd,hdr->bshr", v_heads, self.mimo_x_down.to(v_heads.dtype))
+        mix = torch.einsum(
+            "bshd,hdr->bshr", v_heads, self.mimo_x_down.to(v_heads.dtype)
+        )
         mix = torch.einsum("bshr,hrd->bshd", mix, self.mimo_x_up.to(v_heads.dtype))
         return v_heads + mix
 
@@ -314,39 +323,63 @@ class StateSpaceRecurrence(nn.Module):
             C_mat = _are(C_mat, freqs)
 
         # ── 2. Resize / reset state buffers ──────────────────────────
-        if B_comp > self.ssm_state.shape[0]:
-            self.register_buffer(
-                "ssm_state",
-                torch.zeros(
-                    B_comp,
-                    self.n_heads,
-                    self.d_head,
-                    self.d_state,
-                    device=x.device,
-                    dtype=torch.float32,
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                "conv_state",
-                torch.zeros(
-                    B_comp,
-                    self.d_model,
-                    self.kernel_size - 1,
-                    device=x.device,
-                    dtype=x.dtype,
-                ),
-                persistent=False,
-            )
+        # During gradient checkpointing, in-place ops (zero_, copy_) on register_buffer
+        # cause "tensor count mismatch" (use_reentrant=False) or "backward twice"
+        # (use_reentrant=True).  Fix: use local tensors during training with start_pos=0
+        # (the common training path), skipping all persistent buffer mutations.
+        _use_buf_state = not (self.training and start_pos == 0)
 
-        if start_pos == 0:
-            self.ssm_state[:B_comp].zero_()
-            self.conv_state[:B_comp].zero_()
+        if not _use_buf_state:
+            # Training with start_pos=0: local tensors, no buffer mutations
+            conv_state = torch.zeros(
+                B_comp,
+                self.d_model,
+                self.kernel_size - 1,
+                device=x.device,
+                dtype=x.dtype,
+            )
+            ssm_state = torch.zeros(
+                B_comp,
+                self.n_heads,
+                self.d_head,
+                self.d_state,
+                device=x.device,
+                dtype=torch.float32,
+            )
+        else:
+            # Eval or non-zero start_pos: use persistent buffers
+            if B_comp > self.ssm_state.shape[0]:
+                self.register_buffer(
+                    "ssm_state",
+                    torch.zeros(
+                        B_comp,
+                        self.n_heads,
+                        self.d_head,
+                        self.d_state,
+                        device=x.device,
+                        dtype=torch.float32,
+                    ),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    "conv_state",
+                    torch.zeros(
+                        B_comp,
+                        self.d_model,
+                        self.kernel_size - 1,
+                        device=x.device,
+                        dtype=x.dtype,
+                    ),
+                    persistent=False,
+                )
+            if start_pos == 0:
+                self.ssm_state[:B_comp].zero_()
+                self.conv_state[:B_comp].zero_()
+            conv_state = self.conv_state[:B_comp]
+            ssm_state = self.ssm_state[:B_comp]
 
         # ── 3. Causal depthwise conv ──────────────────────────────────
-        padded_v = torch.cat(
-            [self.conv_state[:B_comp].type_as(v), v.transpose(1, 2)], dim=-1
-        )
+        padded_v = torch.cat([conv_state.type_as(v), v.transpose(1, 2)], dim=-1)
         conv_out = F.conv1d(
             padded_v,
             self.conv1d.weight.type_as(padded_v),
@@ -355,7 +388,10 @@ class StateSpaceRecurrence(nn.Module):
             else None,
             groups=self.d_model,
         )
-        self.conv_state[:B_comp].copy_(padded_v[..., -self.kernel_size + 1 :].detach())
+        if _use_buf_state:
+            self.conv_state[:B_comp].copy_(
+                padded_v[..., -self.kernel_size + 1 :].detach()
+            )
         v_conv = conv_out.transpose(1, 2)  # (B_comp, S, d_model)
 
         # ── 4. dt with clamping (Nemotron mamba_dt_min / mamba_dt_max) ─
@@ -367,9 +403,9 @@ class StateSpaceRecurrence(nn.Module):
         dt = dt.clamp(min=self.dt_min, max=self.dt_max)  # <── KEY stabilisation
 
         # Discretise: decay = exp(dt * A)  (ZOH discretisation with learned matrix A)
-        x_decay = dt.unsqueeze(-1) * self.A.view(
-            1, 1, self.n_heads, 1, self.d_state
-        ).float()  # (B_comp, S, H, d_head, d_state)
+        x_decay = (
+            dt.unsqueeze(-1) * self.A.view(1, 1, self.n_heads, 1, self.d_state).float()
+        )  # (B_comp, S, H, d_head, d_state)
         if self.use_heavy_tail:
             # Mamba-3 heavy-tailed (polynomial) decay for long-range memory.
             if self.training:
@@ -387,9 +423,9 @@ class StateSpaceRecurrence(nn.Module):
             v_heads = self._apply_mimo_in(v_heads)
 
         if self.training:
-            prev_s = self.ssm_state[:B_comp].clone()
+            prev_s = ssm_state.clone()
         else:
-            prev_s = self.ssm_state[:B_comp].detach().clone()
+            prev_s = ssm_state.detach().clone()
 
         if self.training:
             if S == 1:
@@ -407,14 +443,17 @@ class StateSpaceRecurrence(nn.Module):
                 y, prev_s = ssm_step_one_jit(decay, v_heads, B_mat, C_mat, prev_s)
             elif S <= self.chunk_size:
                 # Short sequence — fall back to full recurrence
-                y, prev_s = ssm_recurrence_loop_jit(decay, v_heads, B_mat, C_mat, prev_s)
+                y, prev_s = ssm_recurrence_loop_jit(
+                    decay, v_heads, B_mat, C_mat, prev_s
+                )
             else:
                 # Long sequence — chunked sequential scan (memory-locality optimisation)
                 y, prev_s = ssm_chunk_scan_jit(
                     decay, v_heads, B_mat, C_mat, prev_s, self.chunk_size
                 )
 
-        self.ssm_state[:B_comp].copy_(prev_s.detach())
+        if _use_buf_state:
+            self.ssm_state[:B_comp].copy_(prev_s.detach())
 
         # ── Mamba-3 MIMO: low-rank channel mixing on the SSM output ─────
         if self.is_mimo:

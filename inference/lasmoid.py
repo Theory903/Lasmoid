@@ -578,6 +578,10 @@ class Lasmoid(nn.Module):
 
                         return custom_forward
 
+                    # Belt-and-suspenders: force debug flag off at call time
+                    # (Kaggle/Colab may re-enable it after the import-time patch).
+                    _cp._checkpoint_debug_enabled = False
+                    _use_reentrant = False
                     streams, z_loss, vq_loss, routing, indices, adj, event_prob = (
                         torch.utils.checkpoint.checkpoint(
                             create_custom_forward(
@@ -590,7 +594,7 @@ class Lasmoid(nn.Module):
                                 r_step,
                             ),
                             streams,
-                            use_reentrant=True,
+                            use_reentrant=_use_reentrant,
                         )
                     )
                 else:
