@@ -533,8 +533,10 @@ class Lasmoid(nn.Module):
 
         hc = self.hc_mult
         streams_list = [H_dec, H_memory, H_concept]
-        if hc > 3:
-            streams_list += [torch.zeros_like(H_dec)] * (hc - 3)
+        if hc < len(streams_list):
+            streams_list = streams_list[:hc]
+        elif hc > len(streams_list):
+            streams_list += [torch.zeros_like(H_dec)] * (hc - len(streams_list))
         streams = torch.stack(streams_list, dim=2)
 
         # cos & sin removed (relying on freqs_cis)
