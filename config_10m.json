@@ -1,7 +1,7 @@
 {
   "vocab_size": 129286,
   "max_seq_len": 128,
-  "max_batch_size": 4,
+  "max_batch_size": 16,
   "dtype": "bf16",
   "norm_eps": 1e-06,
   "rope_theta": 10000.0,
