@@ -36,7 +36,6 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════
 
 
-@torch.jit.script
 def ssm_step_one(
     decay: torch.Tensor,
     v_heads: torch.Tensor,
@@ -57,7 +56,6 @@ def ssm_step_one(
     return y, curr_s
 
 
-@torch.jit.script
 def ssm_chunk_scan(
     decay: torch.Tensor,
     v_heads: torch.Tensor,
@@ -99,7 +97,6 @@ def ssm_chunk_scan(
     return outputs, curr_s
 
 
-@torch.jit.script
 def heavy_tail_decay(x: torch.Tensor, alpha: float) -> torch.Tensor:
     """Mamba-3 heavy-tailed state decay.
 
@@ -122,7 +119,6 @@ def heavy_tail_decay(x: torch.Tensor, alpha: float) -> torch.Tensor:
     return out.clamp(min=1e-6, max=1.0)
 
 
-@torch.jit.script
 def ssm_recurrence_loop(
     decay: torch.Tensor,
     v_heads: torch.Tensor,
@@ -146,6 +142,13 @@ def ssm_recurrence_loop(
         y_t = (curr_s * C_t).sum(dim=-1)
         outputs[:, t] = y_t
     return outputs, curr_s
+
+
+# Compile JIT-scripted versions for inference acceleration
+ssm_step_one_jit = torch.jit.script(ssm_step_one)
+ssm_chunk_scan_jit = torch.jit.script(ssm_chunk_scan)
+heavy_tail_decay_jit = torch.jit.script(heavy_tail_decay)
+ssm_recurrence_loop_jit = torch.jit.script(ssm_recurrence_loop)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -369,7 +372,10 @@ class StateSpaceRecurrence(nn.Module):
         ).float()  # (B_comp, S, H, d_head, d_state)
         if self.use_heavy_tail:
             # Mamba-3 heavy-tailed (polynomial) decay for long-range memory.
-            decay = heavy_tail_decay(x_decay, float(self.heavy_tail_alpha))
+            if self.training:
+                decay = heavy_tail_decay(x_decay, float(self.heavy_tail_alpha))
+            else:
+                decay = heavy_tail_decay_jit(x_decay, float(self.heavy_tail_alpha))
         else:
             decay = torch.exp(x_decay)
 
@@ -385,16 +391,28 @@ class StateSpaceRecurrence(nn.Module):
         else:
             prev_s = self.ssm_state[:B_comp].detach().clone()
 
-        if S == 1:
-            y, prev_s = ssm_step_one(decay, v_heads, B_mat, C_mat, prev_s)
-        elif S <= self.chunk_size:
-            # Short sequence — fall back to full recurrence
-            y, prev_s = ssm_recurrence_loop(decay, v_heads, B_mat, C_mat, prev_s)
+        if self.training:
+            if S == 1:
+                y, prev_s = ssm_step_one(decay, v_heads, B_mat, C_mat, prev_s)
+            elif S <= self.chunk_size:
+                # Short sequence — fall back to full recurrence
+                y, prev_s = ssm_recurrence_loop(decay, v_heads, B_mat, C_mat, prev_s)
+            else:
+                # Long sequence — chunked sequential scan (memory-locality optimisation)
+                y, prev_s = ssm_chunk_scan(
+                    decay, v_heads, B_mat, C_mat, prev_s, self.chunk_size
+                )
         else:
-            # Long sequence — chunked sequential scan (memory-locality optimisation)
-            y, prev_s = ssm_chunk_scan(
-                decay, v_heads, B_mat, C_mat, prev_s, self.chunk_size
-            )
+            if S == 1:
+                y, prev_s = ssm_step_one_jit(decay, v_heads, B_mat, C_mat, prev_s)
+            elif S <= self.chunk_size:
+                # Short sequence — fall back to full recurrence
+                y, prev_s = ssm_recurrence_loop_jit(decay, v_heads, B_mat, C_mat, prev_s)
+            else:
+                # Long sequence — chunked sequential scan (memory-locality optimisation)
+                y, prev_s = ssm_chunk_scan_jit(
+                    decay, v_heads, B_mat, C_mat, prev_s, self.chunk_size
+                )
 
         self.ssm_state[:B_comp].copy_(prev_s.detach())
 

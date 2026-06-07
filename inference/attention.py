@@ -581,10 +581,30 @@ class CSAAttention(Attention):
         kv_nope = kv[..., :-rd].contiguous()
         kv = torch.cat([kv_nope, kv_rope], dim=-1)
 
+        # ── Run Compressor/Caching First if start_pos == 0 ──
+        if start_pos == 0:
+            if seqlen <= win:
+                self.kv_cache[:bsz, :seqlen] = kv
+            else:
+                cutoff = seqlen % win
+                self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = kv[
+                    :, -win:
+                ].split([win - cutoff, cutoff], dim=1)
+            if self.compress_ratio:
+                compressor_out = self.compressor(x, start_pos)
+                if compressor_out is not None:
+                    if isinstance(compressor_out, tuple):
+                        kv_compress, event_prob = compressor_out
+                        self._last_event_prob = event_prob
+                    else:
+                        kv_compress = compressor_out
+                    kv = torch.cat([kv, kv_compress], dim=1)
+
+        # ── Compute indices after Compressor has run ──
         topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos).to(x.device)
 
         if self.compress_ratio:
-            offset = kv.size(1) if start_pos == 0 else win
+            offset = seqlen if start_pos == 0 else win
             if self.indexer is not None:
                 compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
             else:
@@ -621,35 +641,8 @@ class CSAAttention(Attention):
         if isinstance(self.kv_cache, AdaptiveQuantizedKVCache):
             topk_idxs = self.kv_cache.filter_topk_idxs(topk_idxs, start_pos, win)
 
-        # compress kv & attn
-        if start_pos == 0:
-            if seqlen <= win:
-                self.kv_cache[:bsz, :seqlen] = kv
-            else:
-                cutoff = seqlen % win
-                self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = kv[
-                    :, -win:
-                ].split([win - cutoff, cutoff], dim=1)
-            if self.compress_ratio:
-                compressor_out = self.compressor(x, start_pos)
-                if compressor_out is not None:
-                    if isinstance(compressor_out, tuple):
-                        kv_compress, event_prob = compressor_out
-                        self._last_event_prob = event_prob
-                    else:
-                        kv_compress = compressor_out
-                    kv = torch.cat([kv, kv_compress], dim=1)
-
-            topk_idxs = torch.clamp(topk_idxs, min=-1, max=kv.size(1) - 1)
-            o = sparse_attn(
-                q,
-                kv,
-                self.attn_sink,
-                topk_idxs,
-                self.softmax_scale,
-                soft_cap=self.attn_logits_soft_cap,
-            )
-        else:
+        # ── Run Compressor/Caching if start_pos > 0 ──
+        if start_pos > 0:
             write_start = start_pos % win
             if write_start + seqlen <= win:
                 self.kv_cache[:bsz, write_start : write_start + seqlen] = kv
@@ -665,6 +658,16 @@ class CSAAttention(Attention):
             o = sparse_attn(
                 q,
                 self.kv_cache[:bsz],
+                self.attn_sink,
+                topk_idxs,
+                self.softmax_scale,
+                soft_cap=self.attn_logits_soft_cap,
+            )
+        else:
+            topk_idxs = torch.clamp(topk_idxs, min=-1, max=kv.size(1) - 1)
+            o = sparse_attn(
+                q,
+                kv,
                 self.attn_sink,
                 topk_idxs,
                 self.softmax_scale,
@@ -847,14 +850,36 @@ class HCAAttention(Attention):
         kv_nope = kv[..., :-rd].contiguous()
         kv = torch.cat([kv_nope, kv_rope], dim=-1)
 
+        # ── Run Compressor/Caching First if start_pos == 0 ──
+        if start_pos == 0:
+            if seqlen <= win:
+                self.kv_cache[:bsz, :seqlen] = kv
+            else:
+                cutoff = seqlen % win
+                self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = kv[
+                    :, -win:
+                ].split([win - cutoff, cutoff], dim=1)
+            if self.compress_ratio:
+                compressor_out = self.compressor(x, start_pos)
+                if compressor_out is not None:
+                    if isinstance(compressor_out, tuple):
+                        kv_compress, event_prob = compressor_out
+                        self._last_event_prob = event_prob
+                    else:
+                        kv_compress = compressor_out
+                    kv = torch.cat([kv, kv_compress], dim=1)
+
+        # ── Compute indices after Compressor has run ──
         topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos).to(x.device)
 
         if self.compress_ratio:
-            offset = kv.size(1) if start_pos == 0 else win
+            offset = seqlen if start_pos == 0 else win
             # HCA dynamic index path (no learned indexer)
             cache_cap = self.kv_cache.shape[1] - win
+            ptr_val = self.compressor.cache_write_ptr[:bsz].max().item()
+            print(f"[Attention DEBUG] layer={getattr(self, 'layer_id', -1)}, bsz={bsz}, cache_write_ptr={self.compressor.cache_write_ptr.tolist()}, ptr_val={ptr_val}, cache_cap={cache_cap}")
             cache_len = max(
-                1, min(self.compressor.cache_write_ptr[:bsz].max().item(), cache_cap)
+                1, min(ptr_val, cache_cap)
             )
             if start_pos == 0:
                 fired_positions = self.compressor.fired_indices_buf[:bsz, :cache_len]
@@ -881,35 +906,8 @@ class HCAAttention(Attention):
         if isinstance(self.kv_cache, AdaptiveQuantizedKVCache):
             topk_idxs = self.kv_cache.filter_topk_idxs(topk_idxs, start_pos, win)
 
-        # compress kv & attn
-        if start_pos == 0:
-            if seqlen <= win:
-                self.kv_cache[:bsz, :seqlen] = kv
-            else:
-                cutoff = seqlen % win
-                self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = kv[
-                    :, -win:
-                ].split([win - cutoff, cutoff], dim=1)
-            if self.compress_ratio:
-                compressor_out = self.compressor(x, start_pos)
-                if compressor_out is not None:
-                    if isinstance(compressor_out, tuple):
-                        kv_compress, event_prob = compressor_out
-                        self._last_event_prob = event_prob
-                    else:
-                        kv_compress = compressor_out
-                    kv = torch.cat([kv, kv_compress], dim=1)
-
-            topk_idxs = torch.clamp(topk_idxs, min=-1, max=kv.size(1) - 1)
-            o = sparse_attn(
-                q,
-                kv,
-                self.attn_sink,
-                topk_idxs,
-                self.softmax_scale,
-                soft_cap=self.attn_logits_soft_cap,
-            )
-        else:
+        # ── Run Compressor/Caching if start_pos > 0 ──
+        if start_pos > 0:
             write_start = start_pos % win
             if write_start + seqlen <= win:
                 self.kv_cache[:bsz, write_start : write_start + seqlen] = kv
@@ -925,6 +923,16 @@ class HCAAttention(Attention):
             o = sparse_attn(
                 q,
                 self.kv_cache[:bsz],
+                self.attn_sink,
+                topk_idxs,
+                self.softmax_scale,
+                soft_cap=self.attn_logits_soft_cap,
+            )
+        else:
+            topk_idxs = torch.clamp(topk_idxs, min=-1, max=kv.size(1) - 1)
+            o = sparse_attn(
+                q,
+                kv,
                 self.attn_sink,
                 topk_idxs,
                 self.softmax_scale,

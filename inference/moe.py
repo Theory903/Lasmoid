@@ -104,6 +104,7 @@ class Gate(nn.Module):
                 torch.zeros(args.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
+        self._saved_indices = None
 
     def apply_pending_updates(self):
         if self.bias is not None and self.pending_bias_updates:
@@ -111,6 +112,9 @@ class Gate(nn.Module):
                 for update in self.pending_bias_updates:
                     self.bias.add_(update)
             self.pending_bias_updates.clear()
+
+    def clear_saved_checkpoint_state(self):
+        self._saved_indices = None
 
     def forward(
         self,
@@ -216,14 +220,21 @@ class Gate(nn.Module):
             )
 
             if self.use_hash and input_ids is not None:
-                indices = self.tid2eid[input_ids]
+                indices_dyn = self.tid2eid[input_ids]
             else:
-                indices = scores_masked.topk(self.topk, dim=-1)[1]
+                indices_dyn = scores_masked.topk(self.topk, dim=-1)[1]
         else:
             if self.use_hash and input_ids is not None:
-                indices = self.tid2eid[input_ids]
+                indices_dyn = self.tid2eid[input_ids]
             else:
-                indices = scores_for_choice.topk(self.topk, dim=-1)[1]
+                indices_dyn = scores_for_choice.topk(self.topk, dim=-1)[1]
+
+        if self.training:
+            if self._saved_indices is None:
+                self._saved_indices = indices_dyn
+            indices = self._saved_indices
+        else:
+            indices = indices_dyn
 
         if self.training and self.bias is not None:
             with torch.no_grad():
@@ -343,6 +354,13 @@ class DeepSeekMoE(nn.Module):
         self.last_capacity_overflow = torch.tensor(0.0)
         self.last_router_entropy = torch.tensor(0.0)
         self.last_avg_experts = torch.tensor(float(self.n_activated))
+        self._saved_sel = None
+        self._saved_w = None
+
+    def clear_saved_checkpoint_state(self):
+        self.gate.clear_saved_checkpoint_state()
+        self._saved_sel = None
+        self._saved_w = None
 
     def _adaptive_select(self, probs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Top-p (nucleus) variable-k expert selection per token.
@@ -391,7 +409,24 @@ class DeepSeekMoE(nn.Module):
         if self.gate.last_expert_mask is not None:
             probs = probs.masked_fill(~self.gate.last_expert_mask, 0.0)
 
-        sel, w = self._adaptive_select(probs)
+        # Always run the dynamic selection logic to build the exact same autograd graph in both passes
+        sel_dyn, w_dyn = self._adaptive_select(probs)
+
+        if self.training:
+            if self._saved_sel is None:
+                self._saved_sel = sel_dyn
+            sel = self._saved_sel
+            print(f"[MoE DEBUG] training={self.training}, sel_dyn sum={sel_dyn.sum().item()}, saved_sel sum={self._saved_sel.sum().item()}")
+            # Since sel is boolean, we compute w dynamically from probs and sel.
+            # This ensures that:
+            # 1. w matches the saved shape and content from the forward pass.
+            # 2. w maintains its dynamic gradient path with respect to probs.
+            w = probs * sel
+            w_sum = w.sum(dim=-1, keepdim=True)
+            w = w / (w_sum + 1e-8) * self.gate.route_scale
+        else:
+            sel = sel_dyn
+            w = w_dyn
 
         # ── Correct EMA bias for adaptive routing ────────────────────────
         # Gate.forward computed an EMA bias update based on its internal

@@ -99,7 +99,9 @@ class LasmoidBlock(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        Optional[torch.Tensor],
     ]:
+        print(f"--- BLOCK {self.layer_id} FORWARD ---")
         if layer_feats is not None:
             proj_feats = self.layer_feats_proj(layer_feats.to(streams.dtype))
             # Inject modality features into the primary stream (stream 0)
@@ -162,4 +164,6 @@ class LasmoidBlock(nn.Module):
         indices = torch.zeros(B, S, dtype=torch.long, device=streams.device)
         adj = torch.zeros(1, 1, device=streams.device, dtype=streams.dtype)
 
-        return streams, z_loss, vq_loss, routing, indices, adj
+        event_prob = getattr(self.attn, "_last_event_prob", None)
+
+        return streams, z_loss, vq_loss, routing, indices, adj, event_prob

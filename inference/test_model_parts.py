@@ -386,7 +386,7 @@ class TestLasmoidComponents(unittest.TestCase):
             self.args.rope_head_dim, 64, base=self.args.rope_theta
         ).to(self.device)
 
-        out, z_loss, vq_loss, routing, indices, adj = block(
+        out, z_loss, vq_loss, routing, indices, adj, event_prob = block(
             x,
             freqs_cis[:10],
             start_pos=0,
@@ -2043,7 +2043,7 @@ class TestLasmoidComponents(unittest.TestCase):
         from dataclasses import fields
         from config import ModelArgs
 
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_1b_2m.json")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "configs", "model", "config_1b_2m.json")
         with open(path) as f:
             data = json.load(f)
 
@@ -3038,7 +3038,7 @@ class TestLasmoidComponents(unittest.TestCase):
         import json
         from pathlib import Path
 
-        config_path = Path(__file__).resolve().parent.parent / "config_100m.json"
+        config_path = Path(__file__).resolve().parent.parent / "configs" / "model" / "config_100m.json"
         with open(config_path) as f:
             raw = json.load(f)
 

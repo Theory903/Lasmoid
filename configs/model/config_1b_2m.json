@@ -69,5 +69,10 @@
   "frac_shared_layers": 0.5,
   "kv_cache_share_global": false,
   "kv_cache_share_local": false,
-  "per_layer_input_dim": 64
+  "per_layer_input_dim": 64,
+  "attention_type": "hybrid",
+  "ssm_is_mimo": true,
+  "mtp_speculation_enabled": true,
+  "use_fp8_kv": true,
+  "stability_enabled": true
 }

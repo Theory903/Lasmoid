@@ -364,6 +364,11 @@ class Lasmoid(nn.Module):
             if isinstance(m, Gate):
                 m.apply_pending_updates()
 
+    def clear_saved_checkpoint_states(self):
+        for m in self.modules():
+            if hasattr(m, "clear_saved_checkpoint_state"):
+                m.clear_saved_checkpoint_state()
+
     def _hc_head_reduce(self, x: torch.Tensor) -> torch.Tensor:
         shape, dtype = x.size(), x.dtype
         B, S, hc, D = shape
@@ -402,6 +407,7 @@ class Lasmoid(nn.Module):
         List[torch.Tensor],
     ]:
         if self.training:
+            self.clear_saved_checkpoint_states()
             self.apply_pending_bias_updates()
 
         B, N_dec = x_dec.shape
@@ -470,6 +476,7 @@ class Lasmoid(nn.Module):
         routing_maps = []
         concept_indices = []
         adjacencies = []
+        event_probs = []
 
         # ── Chain-of-Thought Budget (Reasoning State-Machine) ──────────────
         reasoning_steps = getattr(self.args, "reasoning_steps", 1)
@@ -485,7 +492,7 @@ class Lasmoid(nn.Module):
 
                         return custom_forward
 
-                    streams, z_loss, vq_loss, routing, indices, adj = (
+                    streams, z_loss, vq_loss, routing, indices, adj, event_prob = (
                         torch.utils.checkpoint.checkpoint(
                             create_custom_forward(layer),
                             streams,
@@ -495,10 +502,11 @@ class Lasmoid(nn.Module):
                             layer_feats_slice,
                             domain_steer,
                             use_reentrant=False,
+                            debug=True,
                         )
                     )
                 else:
-                    streams, z_loss, vq_loss, routing, indices, adj = layer(
+                    streams, z_loss, vq_loss, routing, indices, adj, event_prob = layer(
                         streams,
                         freqs_cis_dec,
                         start_pos,
@@ -513,17 +521,8 @@ class Lasmoid(nn.Module):
                     routing_maps.append(routing)
                     concept_indices.append(indices)
                     adjacencies.append(adj)
-
-        # Collect CIF event probabilities from attention layers for boundary stabilization loss
-        event_probs = []
-        if self.training and start_pos == 0:
-            for layer in self.layers:
-                attn = layer.attn
-                if (
-                    hasattr(attn, "_last_event_prob")
-                    and attn._last_event_prob is not None
-                ):
-                    event_probs.append(attn._last_event_prob)
+                    if self.training and start_pos == 0 and event_prob is not None:
+                        event_probs.append(event_prob)
 
         self.last_z_loss = total_z_loss
         self.last_moe_loss = total_z_loss

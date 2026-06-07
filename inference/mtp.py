@@ -86,7 +86,7 @@ class MTPBlock(nn.Module):
             h = h_flat.reshape(B_h, S_h, hc_h, D_h)
             x_out = self.e_proj(e).unsqueeze(2) + h
 
-        x_out, z_loss, vq_loss, routing, indices, adj = self.block(
+        x_out, z_loss, vq_loss, routing, indices, adj, _ = self.block(
             x_out, freqs_cis, start_pos, input_ids
         )
 

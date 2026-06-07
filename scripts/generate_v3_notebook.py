@@ -42,33 +42,34 @@ cells.append(cell("""
 # ── SECTION 1: Environment Setup ─────────────────────────────────────────────
 cells.append(cell("## Section 1: Environment Setup", "markdown"))
 cells.append(cell("""
-import subprocess, sys, os, json, time, math, random, gc, shutil
+# Install uv and packages using direct shell commands
+!pip install -q uv
+!uv pip install --system -q git+https://github.com/huggingface/transformers.git bitsandbytes>=0.46.0 accelerate>=1.6.0 datasets>=3.6.0 safetensors>=0.5.3 sentencepiece einops tqdm matplotlib psutil
+
+import os, sys, json, time, math, random, gc, shutil
 from pathlib import Path
 
-def pip(*pkgs):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *pkgs])
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
-# Core deps (versions pinned for reproducibility)
-pip(
-    "transformers>=4.51.0",
-    "bitsandbytes>=0.46.0",
-    "accelerate>=1.6.0",
-    "datasets>=3.6.0",
-    "safetensors>=0.5.3",
-    "sentencepiece",
-    "einops",
-    "tqdm",
-    "matplotlib",
-    "psutil",
-)
-
-# Flash Attention 2 (T4 supports it via xformers fallback)
+# Auto-detect if new transformers is imported in this session. If not, restart kernel.
 try:
-    pip("flash-attn --no-build-isolation")
-    HAS_FLASH = True
+    import transformers
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    has_gemma4 = "gemma4_unified" in CONFIG_MAPPING
 except Exception:
-    HAS_FLASH = False
-    print("Flash-attn unavailable — using SDPA fallback")
+    has_gemma4 = False
+
+if not has_gemma4:
+    print("🔄 Upgraded transformers to main branch, but the running Python kernel is still using the old version.")
+    print("🔄 Restarting kernel automatically to load the new transformers code...")
+    os.kill(os.getpid(), 9)
+else:
+    print(f"✅ Transformers has Gemma-4 support ready! (version: {transformers.__version__})")
+
+# Skip flash-attn compilation to avoid long installation times.
+# Native PyTorch SDPA (scaled_dot_product_attention) is already optimized and uses FlashAttention under the hood when available.
+HAS_FLASH = False
+print("Using native PyTorch SDPA (scaled_dot_product_attention)")
 
 print("✅ Environment ready")
 """))
@@ -108,7 +109,7 @@ from accelerate import Accelerator, DistributedDataParallelKwargs
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 accelerator = Accelerator(
     mixed_precision="bf16",
-    gradient_accumulation_steps=8,   # effective batch = BATCH * 8 per GPU
+    gradient_accumulation_steps=16,  # effective batch = BATCH * 16 per GPU
     kwargs_handlers=[ddp_kwargs],
 )
 
@@ -190,7 +191,7 @@ print(f"Tokenizer vocab size: {VOCAB_SIZE:,}")
 
 # ── Hyperparameters ──────────────────────────────────────────────────────────
 SEQ_LEN      = 512       # max_seq_len for 100M config
-BATCH_SIZE   = 2         # per GPU; effective = 2 × 2 GPUs × 8 grad_accum = 32
+BATCH_SIZE   = 1         # per GPU; effective = 1 × 2 GPUs × 16 grad_accum = 32 (optimized for T4 VRAM)
 MAX_STEPS    = 5000
 CKPT_EVERY   = 50        # crash-safe: save every 50 steps
 TEACHER_MODEL= "google/gemma-4-12B"
@@ -211,13 +212,15 @@ ABLATION_FLAGS = {
 print("Loading datasets (streaming)...")
 
 ds_fineweb = load_dataset(
-    "HuggingFaceFW/fineweb-edu-score-2",
+    "HuggingFaceTB/smollm-corpus",
+    "fineweb-edu-dedup",
     split="train", streaming=True,
     trust_remote_code=True,
 ).select_columns(["text"])
 
 ds_cosmo = load_dataset(
-    "HuggingFaceTB/cosmopedia-v2",
+    "HuggingFaceTB/smollm-corpus",
+    "cosmopedia-v2",
     split="train", streaming=True,
     trust_remote_code=True,
 ).select_columns(["text"])
@@ -263,7 +266,8 @@ def stream_packed(dataset, tokenizer, seq_len: int, max_batches: int = None) -> 
         if len(text) < MIN_CHARS or len(text) > MAX_CHARS:
             continue
         ids = tokenizer.encode(text, add_special_tokens=True)
-        ids.append(tokenizer.eos_token_id)
+        eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.vocab.get("<｜end▁of▁sentence｜>", 1)
+        ids.append(eos_id)
         buf.extend(ids)
         while len(buf) >= seq_len + 1:
             chunk = buf[:seq_len + 1]
@@ -366,7 +370,7 @@ cfg["max_seq_len"]   = SEQ_LEN
 cfg["max_batch_size"]= BATCH_SIZE
 
 args = ModelArgs(**cfg)
-model = Lasmoid(args)
+model = Lasmoid(args).to(DEVICE)
 
 # Enable gradient checkpointing (trades VRAM for recompute)
 model.gradient_checkpointing = True
@@ -470,14 +474,34 @@ bnb_cfg = BitsAndBytesConfig(
     bnb_4bit_use_double_quant = True,
 )
 
+# Determine teacher device: if running single-process with multiple GPUs, offload teacher to GPU 1
+if N_PROC == 1 and torch.cuda.device_count() > 1:
+    TEACHER_DEVICE = torch.device("cuda:1")
+else:
+    TEACHER_DEVICE = DEVICE
+
 if IS_MAIN:
     print(f"Loading teacher: {TEACHER_MODEL}")
     print("  Quantization: 4-bit NF4 (≈6.5 GB)")
+    print(f"  Teacher Device: {TEACHER_DEVICE}")
+    print(f"  Student Device: {DEVICE}")
+
+# Free existing teacher model if it exists in memory to prevent OOM on re-run
+if 'teacher' in globals():
+    print("🧹 Freeing existing teacher model from memory...")
+    del teacher
+    gc.collect()
+    torch.cuda.empty_cache()
+    time.sleep(2)
+
+from transformers import AutoConfig
+config = AutoConfig.from_pretrained(TEACHER_MODEL, trust_remote_code=True, token=HF_TOKEN)
 
 teacher = TeacherCls.from_pretrained(
     TEACHER_MODEL,
+    config              = config,
     quantization_config = bnb_cfg,
-    device_map          = "cuda:0",   # pin teacher to GPU0
+    device_map          = {"": TEACHER_DEVICE},   # map teacher to designated device
     torch_dtype         = torch.bfloat16,
     trust_remote_code   = True,
     token               = HF_TOKEN,
@@ -523,47 +547,51 @@ def get_distill_temperature(step: int, total: int) -> float:
 
 def sparse_kl_distillation_loss(
     student_logits: torch.Tensor,   # [B, S, V_student]
-    teacher_logits: torch.Tensor,   # [B, S, V_teacher] — already on GPU, NF4 output
+    teacher_logits: torch.Tensor,   # [B, S, V_teacher_subset] — already on GPU/sliced
     temperature: float,
     top_k: int = 4096,
 ) -> torch.Tensor:
     \"\"\"
-    Top-K Sparse KL loss.
-    1. Select top-K teacher tokens by logit value.
-    2. Compute soft targets over top-K only (saves 32x memory vs full vocab KL).
-    3. Gather student logits at same positions.
-    4. Return KL(teacher_topK || student_topK) × T².
-
-    Handles teacher/student vocab size mismatch by clamping to min vocab.
+    Optimized Top-K Sparse KL loss.
+    1. Select top-K teacher tokens by logit value in bfloat16.
+    2. Softmax over top-K in float32.
+    3. Gather student logits at same positions *before* scaling.
+    4. Compute KL divergence.
     \"\"\"
     B, S, V_t = teacher_logits.shape
     V_s = student_logits.shape[-1]
-    V   = min(V_t, V_s)   # safe overlap region
+    V   = min(V_t, V_s)
 
-    # Work in float32 for numerical stability
-    t_logits = teacher_logits[..., :V].float() / temperature
-    s_logits = student_logits[..., :V].float() / temperature
+    # Slice teacher logits to match student vocab (just in case)
+    t_logits_slice = teacher_logits[..., :V]
 
-    # Top-K indices from teacher
-    k       = min(top_k, V)
-    tk_vals, tk_idx = t_logits.topk(k, dim=-1)   # [B, S, K]
+    # Find top-K indices using original dtype (bfloat16) to save memory/time
+    k = min(top_k, V)
+    tk_vals, tk_idx = t_logits_slice.topk(k, dim=-1)
 
-    # Gather student logits at teacher's top-K positions
-    s_topk  = s_logits.gather(-1, tk_idx)          # [B, S, K]
+    # Cast to float32 and scale for softmax
+    tk_vals = tk_vals.float() / temperature
+    p_teacher = F.softmax(tk_vals, dim=-1)
 
-    # Soft targets
-    p_teacher = F.softmax(tk_vals, dim=-1)          # [B, S, K]
-    log_q     = F.log_softmax(s_topk, dim=-1)       # [B, S, K]
+    # Gather student logits at teacher's top-K positions directly (before scaling)
+    s_slice = student_logits if V == V_s else student_logits[..., :V]
+    s_topk = s_slice.gather(-1, tk_idx)
+
+    # Cast and scale student gathered logits
+    s_topk = s_topk.float() / temperature
+    log_q = F.log_softmax(s_topk, dim=-1)
 
     # KL divergence (sum over K, mean over B×S)
     kl = (p_teacher * (p_teacher.clamp(min=1e-8).log() - log_q)).sum(-1).mean()
     return kl * (temperature ** 2)
 
-def compute_teacher_logits(teacher, input_ids: torch.Tensor) -> torch.Tensor:
-    \"\"\"Get Gemma-4 logits without gradient, device-safe.\"\"\"
+def compute_teacher_logits(teacher, input_ids: torch.Tensor, vocab_limit: int) -> torch.Tensor:
+    \"\"\"Get Gemma-4 logits without gradient, sliced early to save memory.\"\"\"
     with torch.no_grad():
-        out = teacher(input_ids=input_ids.to("cuda:0"), use_cache=False)
-    return out.logits.to(DEVICE)   # move to student device
+        out = teacher(input_ids=input_ids.to(TEACHER_DEVICE), use_cache=False)
+        # Slice on-device to avoid large VRAM allocation/transfer
+        logits = out.logits[..., :vocab_limit].to(DEVICE)
+    return logits
 
 print("✅ Distillation loss functions ready")
 print(f"  Top-K sparse KL: K={DISTILL_TOP_K}")
@@ -935,63 +963,65 @@ for step in pbar:
         y = y.unsqueeze(0).to(DEVICE)
 
         with accelerator.accumulate(model):
-            # ── Forward pass ────────────────────────────────────────────────
-            out = safe_forward(model, x, x)
-            if out is None:
-                continue   # OOM — skip batch
+            # ── Forward pass with explicit AMP autocast ──
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                out = safe_forward(model, x, x)
+                if out is None:
+                    continue   # OOM — skip batch
 
-            (logits, mtp_logits, concept_db, memory_state,
-             routing_maps, concept_indices, adjacencies, event_probs) = out
+                (logits, mtp_logits, concept_db, memory_state,
+                 routing_maps, concept_indices, adjacencies, event_probs) = out
 
-            # ── Teacher distillation logits ─────────────────────────────────
-            T = get_distill_temperature(step, MAX_STEPS)
-            alpha = get_distill_alpha(step, MAX_STEPS)
+                # ── Teacher distillation logits ──
+                T = get_distill_temperature(step, MAX_STEPS)
+                alpha = get_distill_alpha(step, MAX_STEPS)
 
-            teacher_logits = compute_teacher_logits(teacher, x)
+                teacher_logits = compute_teacher_logits(teacher, x, vocab_limit=VOCAB_SIZE)
 
-            kl_loss = sparse_kl_distillation_loss(
-                logits, teacher_logits, temperature=T, top_k=DISTILL_TOP_K
-            )
+                kl_loss = sparse_kl_distillation_loss(
+                    logits, teacher_logits, temperature=T, top_k=DISTILL_TOP_K
+                )
+                del teacher_logits  # free memory early
 
-            # ── MTP loss ────────────────────────────────────────────────────
-            mtp_loss = None
-            if mtp_logits is not None and x.shape[1] > 1:
-                mtp_targets = y[:, 1:]
-                mtp_logits_trimmed = mtp_logits[:, :mtp_targets.shape[1], :]
-                mtp_loss = torch.nn.functional.cross_entropy(
-                    mtp_logits_trimmed.reshape(-1, mtp_logits_trimmed.shape[-1]),
-                    mtp_targets.reshape(-1),
-                    ignore_index=-100,
+                # ── MTP loss ──
+                mtp_loss = None
+                if mtp_logits is not None and x.shape[1] > 1:
+                    mtp_targets = y[:, 1:]
+                    mtp_logits_trimmed = mtp_logits[:, :mtp_targets.shape[1], :]
+                    mtp_loss = torch.nn.functional.cross_entropy(
+                        mtp_logits_trimmed.reshape(-1, mtp_logits_trimmed.shape[-1]),
+                        mtp_targets.reshape(-1),
+                        ignore_index=-100,
+                    )
+
+                # ── Aggregate Lasmoid loss ──
+                unwrapped = accelerator.unwrap_model(model)
+                total_loss = compute_loss(
+                    logits         = logits,
+                    targets        = y,
+                    routing_maps   = routing_maps,
+                    vq_losses      = [unwrapped.last_vq_loss],
+                    adjacencies    = adjacencies,
+                    event_probs    = event_probs,
+                    moe_aux_loss   = unwrapped.last_moe_loss,
+                    moe_aux_coeff  = args.moe_aux_coeff,
+                    mtp_loss       = mtp_loss,
+                    mtp_coeff      = args.mtp_loss_coeff,
+                    token_concept_loss  = unwrapped.last_token_concept_loss,
+                    token_concept_coeff = args.token_concept_loss_coeff,
+                    commit_loss    = unwrapped.last_commit_loss,
+                    commit_coeff   = args.hcm_commit_loss_coeff,
+                    curiosity_loss = unwrapped.last_curiosity_loss if args.use_curiosity_expert else None,
+                    graph_sparsity = 0.01,
+                    label_smoothing= 0.0,
+                    ignore_index   = -100,
                 )
 
-            # ── Aggregate Lasmoid loss (compute_loss from inference/loss.py) ─
-            unwrapped = accelerator.unwrap_model(model)
-            total_loss = compute_loss(
-                logits         = logits,
-                targets        = y,
-                routing_maps   = routing_maps,
-                vq_losses      = [unwrapped.last_vq_loss],
-                adjacencies    = adjacencies,
-                event_probs    = event_probs,
-                moe_aux_loss   = unwrapped.last_moe_loss,
-                moe_aux_coeff  = args.moe_aux_coeff,
-                mtp_loss       = mtp_loss,
-                mtp_coeff      = args.mtp_loss_coeff,
-                token_concept_loss  = unwrapped.last_token_concept_loss,
-                token_concept_coeff = args.token_concept_loss_coeff,
-                commit_loss    = unwrapped.last_commit_loss,
-                commit_coeff   = args.hcm_commit_loss_coeff,
-                curiosity_loss = unwrapped.last_curiosity_loss if args.use_curiosity_expert else None,
-                graph_sparsity = 0.01,
-                label_smoothing= 0.0,
-                ignore_index   = -100,
-            )
+                # ── Blend CE + KL ──
+                ce_component = total_loss
+                blended_loss = (1.0 - alpha) * ce_component + alpha * (T ** 2) * kl_loss
 
-            # ── Blend CE + KL ────────────────────────────────────────────────
-            ce_component = total_loss   # already contains CE from compute_loss
-            blended_loss = (1.0 - alpha) * ce_component + alpha * (T ** 2) * kl_loss
-
-            # ── Backward ─────────────────────────────────────────────────────
+            # ── Backward ──
             accelerator.backward(blended_loss / accum_steps)
             total_loss_accum += blended_loss.item() / accum_steps
 

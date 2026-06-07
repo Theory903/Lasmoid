@@ -220,6 +220,7 @@ class Compressor(nn.Module):
             torch.zeros(max_batch_size_comp, cache_cap, dtype=torch.long),
             persistent=False,
         )
+        self._saved_num_fires = None
 
     def resize_buffers(self, bsz: int, device: Optional[torch.device] = None):
         if bsz > self.kv_accumulator.shape[0]:
@@ -252,6 +253,9 @@ class Compressor(nn.Module):
                 persistent=False,
             )
 
+    def clear_saved_checkpoint_state(self):
+        self._saved_num_fires = None
+
     def forward(self, x: torch.Tensor, start_pos: int):
         assert self.kv_cache is not None
         bsz, seqlen, _ = x.size()
@@ -267,10 +271,10 @@ class Compressor(nn.Module):
         x_float = x.float()
 
         # Context-independent per-token CIF boundary score (AR == parallel)
-        cif_alpha = self.event_detector.cif_boundary_score(x_float)  # [B, S, 1]
+        cif_alpha = self.event_detector.cif_boundary_score(x_float.detach())  # [B, S, 1]
 
         # Full multi-scale event boundary (context-dependent, for loss only)
-        raw_alpha = self.event_detector(x_float)  # [B, S, 1]
+        raw_alpha = self.event_detector(x_float.detach())  # [B, S, 1]
 
         # Query adaptive gate for context-length-aware compression ratio (P1.3)
         total_seqlen = start_pos + seqlen
@@ -320,7 +324,15 @@ class Compressor(nn.Module):
             #    The trailing partial bucket is NOT emitted; it becomes carryover.
             total_alpha_per_sample = cum_alpha[:, -1, :]  # [B, 1]
             num_complete_fires_per_sample = torch.floor(total_alpha_per_sample).long()  # [B, 1]
-            num_complete_fires = max(1, int(num_complete_fires_per_sample.max().item()))
+            # Always run the dynamic maximum fire calculation to build the exact same autograd graph in both passes
+            num_complete_fires_dyn = max(1, int(num_complete_fires_per_sample.max().item()))
+            if self.training:
+                if self._saved_num_fires is None:
+                    self._saved_num_fires = num_complete_fires_dyn
+                num_complete_fires = self._saved_num_fires
+            else:
+                num_complete_fires = num_complete_fires_dyn
+            print(f"[Compressor DEBUG] training={self.training}, saved={self._saved_num_fires}, dyn={num_complete_fires_dyn}, selected={num_complete_fires}")
 
             # 6. Scatter-add alpha-weighted KV and gate into fire buckets
             fire_idx = fire_bucket.expand(-1, -1, d)  # [B, S, D]
