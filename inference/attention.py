@@ -553,8 +553,8 @@ class CSAAttention(Attention):
             if self.compress_ratio:
                 self.compressor.kv_cache = self.kv_cache[:, win:]
                 if self.indexer is not None:
-                    self.indexer.resize_buffers(bsz, device=device)
-                self.compressor.resize_buffers(bsz, device=device)
+                    self.indexer.resize_buffers(bsz, device=x.device)
+                self.compressor.resize_buffers(bsz, device=x.device)
 
         if self.compress_ratio:
             if self.compressor.kv_cache is None:
@@ -699,8 +699,8 @@ class CSAAttention(Attention):
             if self.compress_ratio:
                 self.compressor.kv_cache = self.kv_cache[:, self.window_size :]
                 if self.indexer is not None:
-                    self.indexer.resize_buffers(bsz, device=device)
-                self.compressor.resize_buffers(bsz, device=device)
+                    self.indexer.resize_buffers(bsz, device=x.device)
+                self.compressor.resize_buffers(bsz, device=x.device)
 
     def reset_cache(self) -> None:
         self.kv_cache.detach_().zero_()
@@ -822,7 +822,7 @@ class HCAAttention(Attention):
 
             if self.compress_ratio:
                 self.compressor.kv_cache = self.kv_cache[:, win:]
-                self.compressor.resize_buffers(bsz, device=device)
+                self.compressor.resize_buffers(bsz, device=x.device)
 
         if self.compress_ratio:
             if self.compressor.kv_cache is None:
@@ -958,7 +958,7 @@ class HCAAttention(Attention):
                 self.register_buffer("kv_cache", new_kv_cache, persistent=False)
             if self.compress_ratio:
                 self.compressor.kv_cache = self.kv_cache[:, self.window_size :]
-                self.compressor.resize_buffers(bsz, device=device)
+                self.compressor.resize_buffers(bsz, device=x.device)
 
     def reset_cache(self) -> None:
         self.kv_cache.detach_().zero_()
@@ -1333,7 +1333,7 @@ class HybridSlidingGlobal(Attention):
         ):
             buf = getattr(self, name)
             if bsz > buf.shape[0]:
-                new = torch.zeros(bsz, *buf.shape[1:], device=device, dtype=buf.dtype)
+                new = torch.zeros(bsz, *buf.shape[1:], device=x.device, dtype=buf.dtype)
                 new[: buf.shape[0]] = buf
                 self.register_buffer(name, new, persistent=False)
 
