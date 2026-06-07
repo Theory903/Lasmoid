@@ -431,6 +431,29 @@ from config import ModelArgs
 from lasmoid import Lasmoid
 from loss import compute_loss
 
+# ── PyTorch checkpoint stoi crash guard ──────────────────────────────────────
+# Kaggle/Colab may set torch.utils.checkpoint._checkpoint_debug_enabled = True,
+# forcing LoggingTensorMode → symbolize_tracebacks (C ext) → ValueError: stoi.
+# This guard permanently disables the debug flag and patches symbolize_tracebacks
+# so the error can never surface — every batch actually completes on GPU.
+import torch.utils.checkpoint as _cp
+_cp._checkpoint_debug_enabled = False
+def _noop_setter(enabled=None):
+    pass
+_cp.set_checkpoint_debug_enabled = _noop_setter
+try:
+    import torch.testing._internal.logging_tensor as _lt
+    _orig_sym = _lt.symbolize_tracebacks
+    def _safe_sym(tb_list):
+        try:
+            return _orig_sym(tb_list)
+        except (ValueError, Exception):
+            return [[] for _ in tb_list]
+    _lt.symbolize_tracebacks = _safe_sym
+except Exception:
+    pass
+del _cp
+
 # Load base 100M config
 cfg_path = REPO_DIR / "configs" / "model" / "config_gemma4_100m.json"
 with open(cfg_path) as f:
