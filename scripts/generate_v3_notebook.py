@@ -861,6 +861,8 @@ def safe_forward(model, x_enc, x_dec):
     \"\"\"
     Attempt model forward. On CUDA OOM: clear cache and return None
     to signal the training loop to skip this batch.
+    Also catches ValueError (PyTorch symbolizer bug: stoi/storage)
+    which can occur under gradient checkpointing in Kaggle/Colab.
     \"\"\"
     try:
         return model(x_enc, x_dec)
@@ -868,6 +870,12 @@ def safe_forward(model, x_enc, x_dec):
         print("  ⚠️  OOM on forward — skipping batch")
         oom_step()
         return None
+    except ValueError as _e:
+        _msg = str(_e)
+        if any(kw in _msg for kw in ("stoi", "storage", "symbolize")):
+            print(f"  ⚠️  PyTorch symbolizer ValueError (skipping batch): {_msg}")
+            return None
+        raise
 
 print("✅ Model wrapped with Accelerate (DDP + bf16)")
 print(f"   Model on: {next(model.parameters()).device}")

@@ -5,16 +5,40 @@ Extracted from monolithic model.py during Phase 0 SOLiD refactoring.
 """
 
 import torch
-# Monkeypatch to bypass a bug in PyTorch's trace symbolizer (ValueError: stoi / storage)
+
+# ── PyTorch checkpoint debug/symbolizer crash guard ────────────────────────────
+# Root cause: In Kaggle/Colab, `torch.utils.checkpoint._checkpoint_debug_enabled`
+# may be set to True by the environment, overriding `debug=False` and forcibly
+# activating LoggingTensorMode → capture_logs → symbolize_tracebacks (C ext)
+# → ValueError: stoi.  We neutralize it at import time and patch the C-ext
+# symbolizer as a belt-and-suspenders fallback.
 try:
-    import torch.testing._internal.logging_tensor as lt
-    _orig_symbolize = lt.symbolize_tracebacks
+    import torch.utils.checkpoint as _cp
+    # 1. Neutralise any ambient global debug flag.
+    if hasattr(_cp, 'set_checkpoint_debug_enabled'):
+        _cp.set_checkpoint_debug_enabled(None)
+    # 2. Expose noop_context_fn at module level for use in our checkpoint call.
+    from torch.utils.checkpoint import noop_context_fn as _noop_context_fn
+except Exception:
+    _noop_context_fn = None  # type: ignore[assignment]
+
+try:
+    # 3. Belt-and-suspenders: patch symbolize_tracebacks in-place so any path
+    #    that still reaches it gets a safe fallback instead of crashing.
+    import torch.testing._internal.logging_tensor as _lt
+    _orig_symbolize = _lt.symbolize_tracebacks
     def _safe_symbolize(tracebacks_list):
         try:
             return _orig_symbolize(tracebacks_list)
-        except ValueError:
+        except (ValueError, Exception):
             return [[] for _ in tracebacks_list]
-    lt.symbolize_tracebacks = _safe_symbolize
+    _lt.symbolize_tracebacks = _safe_symbolize
+    # Also patch via sys.modules key in case of alternate import paths.
+    import sys as _sys
+    for _mod_name, _mod in list(_sys.modules.items()):
+        if _mod is not None and hasattr(_mod, 'symbolize_tracebacks'):
+            if getattr(_mod, 'symbolize_tracebacks') is _orig_symbolize:
+                setattr(_mod, 'symbolize_tracebacks', _safe_symbolize)
 except Exception:
     pass
 
@@ -505,6 +529,7 @@ class Lasmoid(nn.Module):
 
                         return custom_forward
 
+                    _ctx_fn = _noop_context_fn if _noop_context_fn is not None else torch.utils.checkpoint.noop_context_fn
                     streams, z_loss, vq_loss, routing, indices, adj, event_prob = (
                         torch.utils.checkpoint.checkpoint(
                             create_custom_forward(layer),
@@ -516,6 +541,7 @@ class Lasmoid(nn.Module):
                             domain_steer,
                             r_step,
                             use_reentrant=False,
+                            context_fn=_ctx_fn,  # bypass LoggingTensorMode entirely
                             debug=False,
                             determinism_check="none",
                         )
