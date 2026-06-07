@@ -14,31 +14,34 @@ import torch
 # symbolizer as a belt-and-suspenders fallback.
 try:
     import torch.utils.checkpoint as _cp
+
     # 1. Neutralise any ambient global debug flag.
-    if hasattr(_cp, 'set_checkpoint_debug_enabled'):
+    if hasattr(_cp, "set_checkpoint_debug_enabled"):
         _cp.set_checkpoint_debug_enabled(None)
-    # 2. Expose noop_context_fn at module level for use in our checkpoint call.
-    from torch.utils.checkpoint import noop_context_fn as _noop_context_fn
 except Exception:
-    _noop_context_fn = None  # type: ignore[assignment]
+    pass
 
 try:
     # 3. Belt-and-suspenders: patch symbolize_tracebacks in-place so any path
     #    that still reaches it gets a safe fallback instead of crashing.
     import torch.testing._internal.logging_tensor as _lt
+
     _orig_symbolize = _lt.symbolize_tracebacks
+
     def _safe_symbolize(tracebacks_list):
         try:
             return _orig_symbolize(tracebacks_list)
         except (ValueError, Exception):
             return [[] for _ in tracebacks_list]
+
     _lt.symbolize_tracebacks = _safe_symbolize
     # Also patch via sys.modules key in case of alternate import paths.
     import sys as _sys
+
     for _mod_name, _mod in list(_sys.modules.items()):
-        if _mod is not None and hasattr(_mod, 'symbolize_tracebacks'):
-            if getattr(_mod, 'symbolize_tracebacks') is _orig_symbolize:
-                setattr(_mod, 'symbolize_tracebacks', _safe_symbolize)
+        if _mod is not None and hasattr(_mod, "symbolize_tracebacks"):
+            if getattr(_mod, "symbolize_tracebacks") is _orig_symbolize:
+                setattr(_mod, "symbolize_tracebacks", _safe_symbolize)
 except Exception:
     pass
 
@@ -204,7 +207,9 @@ class Lasmoid(nn.Module):
         self.per_layer_embeddings = nn.Parameter(
             torch.randn(3, args.n_layers, per_layer_dim, dtype=torch.bfloat16) * 0.02
         )
-        self.per_layer_proj = Linear(args.dim, args.n_layers * per_layer_dim, dtype=torch.bfloat16)
+        self.per_layer_proj = Linear(
+            args.dim, args.n_layers * per_layer_dim, dtype=torch.bfloat16
+        )
         self.per_layer_norm = RMSNorm(per_layer_dim, args.norm_eps)
 
         # Multi-Token Prediction (MTP)
@@ -257,7 +262,9 @@ class Lasmoid(nn.Module):
                 from moe import DeepSeekMoE
 
             for layer in self.layers:
-                if hasattr(layer, "moe_layer") and isinstance(layer.moe_layer, DeepSeekMoE):
+                if hasattr(layer, "moe_layer") and isinstance(
+                    layer.moe_layer, DeepSeekMoE
+                ):
                     if self.args.quant_config.moe_route_dtype == "nvfp4":
                         layer.moe_layer.quantize_routed_experts_to_nvfp4()
                     elif self.args.quant_config.moe_route_dtype == "fp8":
@@ -265,7 +272,6 @@ class Lasmoid(nn.Module):
 
                     if self.args.quant_config.moe_shared_dtype == "fp8":
                         layer.moe_layer.quantize_shared_expert_to_fp8()
-
 
     def create_kv_cache_sharing_patterns(self):
         frac = getattr(self.args, "frac_shared_layers", 0.0)
@@ -349,7 +355,9 @@ class Lasmoid(nn.Module):
         vision_output_length: int = 280,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # 1. Base text/external embedding
-        fused_embeddings = self.embed_tokens(x_dec, external_embeddings).to(torch.bfloat16)
+        fused_embeddings = self.embed_tokens(x_dec, external_embeddings).to(
+            torch.bfloat16
+        )
         B, N_dec, dim = fused_embeddings.shape
 
         modality_ids = torch.full(
@@ -370,7 +378,9 @@ class Lasmoid(nn.Module):
                 idx_v = (x_dec[b] == IMAGE_PLACEHOLDER).nonzero(as_tuple=True)[0]
                 if len(idx_v) > 0:
                     min_len = min(len(idx_v), vision_embeddings.size(1))
-                    fused_embeddings[b, idx_v[:min_len]] = vision_embeddings[b, :min_len].to(fused_embeddings.dtype)
+                    fused_embeddings[b, idx_v[:min_len]] = vision_embeddings[
+                        b, :min_len
+                    ].to(fused_embeddings.dtype)
                     modality_ids[b, idx_v[:min_len]] = 1  # MODALITY_VISION
 
         # 3. Interleave audio embeddings if present
@@ -382,14 +392,20 @@ class Lasmoid(nn.Module):
                 idx_a = (x_dec[b] == AUDIO_PLACEHOLDER).nonzero(as_tuple=True)[0]
                 if len(idx_a) > 0:
                     min_len = min(len(idx_a), audio_embeddings.size(1))
-                    fused_embeddings[b, idx_a[:min_len]] = audio_embeddings[b, :min_len].to(fused_embeddings.dtype)
+                    fused_embeddings[b, idx_a[:min_len]] = audio_embeddings[
+                        b, :min_len
+                    ].to(fused_embeddings.dtype)
                     modality_ids[b, idx_a[:min_len]] = 2  # MODALITY_AUDIO
 
         # 4. Compute per-layer modality features
-        layer_proj_out = self.per_layer_proj(fused_embeddings)  # [B, N_dec, n_layers * per_layer_input_dim]
+        layer_proj_out = self.per_layer_proj(
+            fused_embeddings
+        )  # [B, N_dec, n_layers * per_layer_input_dim]
         layer_proj_out = layer_proj_out.view(B, N_dec, self.args.n_layers, -1)
 
-        mod_embeddings = self.per_layer_embeddings[modality_ids]  # [B, N_dec, n_layers, per_layer_input_dim]
+        mod_embeddings = self.per_layer_embeddings[
+            modality_ids
+        ]  # [B, N_dec, n_layers, per_layer_input_dim]
 
         layer_feats = layer_proj_out + mod_embeddings
         layer_feats = self.per_layer_norm(layer_feats)
@@ -495,7 +511,9 @@ class Lasmoid(nn.Module):
             H_dec, _curiosity, curiosity_loss = self.curiosity_expert(H_dec, concept_db)
             self.last_curiosity_loss = curiosity_loss
         else:
-            self.last_curiosity_loss = torch.tensor(0.0, device=x_dec.device, dtype=torch.float32)
+            self.last_curiosity_loss = torch.tensor(
+                0.0, device=x_dec.device, dtype=torch.float32
+            )
 
         H_memory = torch.mean(memory_state, dim=1, keepdim=True).expand(-1, N_dec, -1)
         H_concept = torch.mean(concept_db, dim=1, keepdim=True).expand(-1, N_dec, -1)
@@ -523,27 +541,41 @@ class Lasmoid(nn.Module):
                 layer_feats_slice = layer_feats[:, :, layer.layer_id, :]
                 if self.gradient_checkpointing and self.training:
 
-                    def create_custom_forward(module):
-                        def custom_forward(*inputs):
-                            return module(*inputs)
+                    def create_custom_forward(
+                        module,
+                        freqs_cis_dec,
+                        start_pos,
+                        x_dec,
+                        layer_feats_slice,
+                        domain_steer,
+                        r_step,
+                    ):
+                        def custom_forward(streams):
+                            return module(
+                                streams,
+                                freqs_cis_dec,
+                                start_pos,
+                                x_dec,
+                                layer_feats=layer_feats_slice,
+                                domain_steer=domain_steer,
+                                r_step=r_step,
+                            )
 
                         return custom_forward
 
-                    _ctx_fn = _noop_context_fn if _noop_context_fn is not None else torch.utils.checkpoint.noop_context_fn
                     streams, z_loss, vq_loss, routing, indices, adj, event_prob = (
                         torch.utils.checkpoint.checkpoint(
-                            create_custom_forward(layer),
+                            create_custom_forward(
+                                layer,
+                                freqs_cis_dec,
+                                start_pos,
+                                x_dec,
+                                layer_feats_slice,
+                                domain_steer,
+                                r_step,
+                            ),
                             streams,
-                            freqs_cis_dec,
-                            start_pos,
-                            x_dec,
-                            layer_feats_slice,
-                            domain_steer,
-                            r_step,
-                            use_reentrant=False,
-                            context_fn=_ctx_fn,  # bypass LoggingTensorMode entirely
-                            debug=False,
-                            determinism_check="none",
+                            use_reentrant=True,  # bypass LoggingTensorMode entirely
                         )
                     )
                 else:

@@ -42,7 +42,20 @@ class Muon(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
     @torch.no_grad()
-    def step(self):
+    def step(self, closure=None):
+        """Perform a single Muon optimisation step.
+
+        Args:
+            closure: A closure that re-evaluates the model and returns the
+                loss. Optional; required by the ``torch.optim.Optimizer``
+                interface so that wrappers like ``accelerate`` can call
+                ``step(closure)`` without raising a ``TypeError``.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
         for group in self.param_groups:
             lr, momentum = group["lr"], group["momentum"]
             ns_steps = group["ns_steps"]
@@ -93,6 +106,8 @@ class Muon(torch.optim.Optimizer):
                     # build_optimizers flow, non-2D params go to AdamW instead).
                     update = buf
                 p.add_(update, alpha=-lr * snr_scale)
+
+        return loss
 
 
 def get_lr_multiplier(step: int, total_steps: int, warmup_steps: int) -> float:
