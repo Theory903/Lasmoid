@@ -9,6 +9,7 @@ Run:  python scripts/generate_v3_notebook.py
 import json, textwrap, os
 from pathlib import Path
 
+
 def cell(source: str, cell_type: str = "code", metadata: dict = None) -> dict:
     src = textwrap.dedent(source).lstrip("\n")
     if cell_type == "markdown":
@@ -33,15 +34,21 @@ def cell(source: str, cell_type: str = "code", metadata: dict = None) -> dict:
 cells = []
 
 # ── Title ────────────────────────────────────────────────────────────────────
-cells.append(cell("""
+cells.append(
+    cell(
+        """
 # Lasmoid V3 — Production Kaggle Training Notebook
 ### Hybrid Concept Transformer | Gemma-4-12B Distillation
 *20 Sections · Lasmoid-specific APIs · Production-grade crash recovery*
-""", "markdown"))
+""",
+        "markdown",
+    )
+)
 
 # ── SECTION 1: Environment Setup ─────────────────────────────────────────────
 cells.append(cell("## Section 1: Environment Setup", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 # Install uv and packages using direct shell commands
 !pip install -q uv
 !uv pip install --system -q git+https://github.com/huggingface/transformers.git bitsandbytes>=0.46.0 accelerate>=1.6.0 datasets>=3.6.0 safetensors>=0.5.3 sentencepiece einops tqdm matplotlib psutil
@@ -72,11 +79,13 @@ HAS_FLASH = False
 print("Using native PyTorch SDPA (scaled_dot_product_attention)")
 
 print("✅ Environment ready")
-"""))
+""")
+)
 
 # ── SECTION 2: GPU Detection ─────────────────────────────────────────────────
 cells.append(cell("## Section 2: GPU Detection", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 import torch
 
 def gpu_info():
@@ -99,11 +108,13 @@ if GPU["n_gpus"] == 0:
 DTYPE = torch.bfloat16  # T4 supports bf16 via software emulation; works for training
 print(f"Compute dtype: {DTYPE}")
 print(f"Total VRAM   : {GPU['total_vram_gb']:.1f} GB")
-"""))
+""")
+)
 
 # ── SECTION 3: Multi-GPU Setup ───────────────────────────────────────────────
 cells.append(cell("## Section 3: Accelerate Multi-GPU Setup (DDP)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 from accelerate import Accelerator, DistributedDataParallelKwargs
 
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -128,11 +139,13 @@ SEED = 42
 random.seed(SEED); torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
-"""))
+""")
+)
 
 # ── SECTION 4: Paths & Config ────────────────────────────────────────────────
 cells.append(cell("## Section 4a: Paths, HF Token, Config", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 import os
 from pathlib import Path
 
@@ -173,11 +186,61 @@ sys.path.insert(0, str(REPO_DIR / "train"))
 
 print(f"Repo : {REPO_DIR}")
 print(f"CKPTs: {CKPT_DIR}")
-"""))
+""")
+)
 
-# ── SECTION 4b: Dataset Streaming ────────────────────────────────────────────
-cells.append(cell("## Section 4b: Dataset Streaming (FineWeb-Edu + Cosmopedia + Distillation)", "markdown"))
-cells.append(cell("""
+# ── SECTION 4b: Graceful Shutdown ────────────────────────────────────────────
+cells.append(
+    cell("## Section 4b: Graceful Shutdown (SIGTERM/SIGINT Handler)", "markdown")
+)
+cells.append(
+    cell("""
+import signal
+
+# Register a handler that saves checkpoint on Kaggle session timeout (SIGTERM)
+# or manual interrupt (SIGINT).  Without this, an abrupt kill loses all progress
+# since the last checkpoint save.
+_CHECKPOINT_ON_KILL = {"step": 0, "dataset_idx": 0}
+
+def _shutdown_handler(signum, frame):
+    sig_name = signal.Signals(signum).name
+    print(f"\\n⚠️  Received {sig_name} — saving emergency checkpoint...")
+    step = _CHECKPOINT_ON_KILL.get("step", 0)
+    ds_idx = _CHECKPOINT_ON_KILL.get("dataset_idx", 0)
+    if step > 0:
+        ckpt_dir = CKPT_DIR / "emergency"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        from safetensors.torch import save_file as sf_save
+        sf_save(
+            {k: v.cpu() for k, v in accelerator.unwrap_model(model).state_dict().items()},
+            str(ckpt_dir / "model.safetensors"),
+        )
+        save_cursor(step, ds_idx)
+        latest = CKPT_DIR / "latest"
+        if latest.is_symlink():
+            latest.unlink()
+        latest.symlink_to(ckpt_dir.name)
+        print(f"  💾 Emergency checkpoint saved at step {step}")
+    else:
+        print("  No progress yet — skipping emergency save.")
+    print("Exiting gracefully.")
+    exit(0)
+
+signal.signal(signal.SIGTERM, _shutdown_handler)
+signal.signal(signal.SIGINT, _shutdown_handler)
+print("✅ Graceful shutdown handler registered (SIGTERM/SIGINT)")
+""")
+)
+
+# ── SECTION 4c: Dataset Streaming ────────────────────────────────────────────
+cells.append(
+    cell(
+        "## Section 4c: Dataset Streaming (FineWeb-Edu + Cosmopedia + Distillation)",
+        "markdown",
+    )
+)
+cells.append(
+    cell("""
 from datasets import load_dataset, interleave_datasets
 from transformers import AutoTokenizer
 import torch
@@ -232,11 +295,13 @@ ds_train = interleave_datasets(
     seed=SEED,
 )
 print("✅ Datasets ready (streaming)")
-"""))
+""")
+)
 
 # ── SECTION 5: Dataset Cleaning ──────────────────────────────────────────────
 cells.append(cell("## Section 5: Dataset Cleaning & Sequence Packing", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 import re
 from typing import Iterator
 
@@ -280,11 +345,13 @@ def stream_packed(dataset, tokenizer, seq_len: int, max_batches: int = None) -> 
                 return
 
 print("✅ Sequence packer ready")
-"""))
+""")
+)
 
 # ── SECTION 6: Tokenizer Analysis ────────────────────────────────────────────
 cells.append(cell("## Section 6: Tokenizer Efficiency Analysis", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 from collections import Counter
 import matplotlib
 matplotlib.use("Agg")
@@ -343,11 +410,18 @@ for ex in ds_train:
         break
 
 TOK_STATS = tokenizer_analysis(tokenizer, sample_texts)
-"""))
+""")
+)
 
 # ── SECTION 7: Model Construction ────────────────────────────────────────────
-cells.append(cell("## Section 7: Lasmoid Model Construction (100M, Ablation-Corrected)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell(
+        "## Section 7: Lasmoid Model Construction (100M, Ablation-Corrected)",
+        "markdown",
+    )
+)
+cells.append(
+    cell("""
 import json, sys
 from pathlib import Path
 
@@ -401,15 +475,39 @@ print(f"  VRAM estimate : ~{vram_est:.1f} GB (params+grads, bf16)")
 print(f"  Seq len       : {SEQ_LEN}")
 print(f"  Batch size    : {BATCH_SIZE} per GPU")
 print("=" * 55)
-"""))
+""")
+)
 
 # ── SECTION 8: Optimizers ────────────────────────────────────────────────────
-cells.append(cell("## Section 8: Muon + AdamW Dual Optimizer & WSD Scheduler", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("## Section 8: Muon + AdamW Dual Optimizer & WSD Scheduler", "markdown")
+)
+cells.append(
+    cell("""
 sys.path.insert(0, str(REPO_DIR / "train"))
 
-from optimizer import build_optimizers, clip_grad_global_norm
+from optimizer import build_optimizers, clip_grad_global_norm, Muon
 from scheduler import WSDScheduler
+
+# ── Muon.step(closure) compatibility patch ──────────────────────────────────
+# Guard against a stale remote-repo clone where Muon.step() may not accept
+# `closure=None`.  Accelerate's optimizer wrapper calls `step(closure)`, so
+# the method *must* accept it; otherwise every step raises TypeError.
+#
+# The patch is idempotent (guarded by __patched flag) and safe even if the
+# local file already has closure support — extra protection costs nothing.
+if not getattr(Muon.step, '__patched', False):
+    _orig_muon_step = Muon.step
+    @torch.no_grad()
+    def _patched_muon_step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        return _orig_muon_step(self)
+    Muon.step = _patched_muon_step
+    Muon.step.__patched = True
+    del _orig_muon_step
 
 # Build Muon + AdamW split (uses build_param_groups internally)
 # - Muon  → all 2D hidden weights (transformer body)
@@ -453,11 +551,13 @@ scheduler = WSDScheduler(
 print(f"Steps: warmup={warmup_steps}, stable={stable_steps}, decay={decay_steps}")
 print(f"Muon  base LR: {MUON_LR}")
 print(f"AdamW base LR: {ADAMW_LR}")
-"""))
+""")
+)
 
 # ── SECTION 9: Teacher Loading ───────────────────────────────────────────────
 cells.append(cell("## Section 9: Gemma-4-12B Teacher (4-bit NF4, frozen)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 from transformers import AutoTokenizer as HFTok, BitsAndBytesConfig
 try:
     from transformers import AutoModelForImageTextToText as TeacherCls
@@ -516,11 +616,18 @@ teacher_tok = HFTok.from_pretrained(TEACHER_MODEL, token=HF_TOKEN)
 print(f"✅ Teacher loaded. Params: {sum(p.numel() for p in teacher.parameters())/1e9:.1f}B")
 print(f"   Teacher vocab: {teacher_tok.vocab_size:,} | Lasmoid vocab: {VOCAB_SIZE:,}")
 TEACHER_VOCAB = teacher_tok.vocab_size
-"""))
+""")
+)
 
 # ── SECTION 10: Distillation Loss ────────────────────────────────────────────
-cells.append(cell("## Section 10: SOTA Distillation Loss (Top-K Sparse KL + Temperature Annealing)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell(
+        "## Section 10: SOTA Distillation Loss (Top-K Sparse KL + Temperature Annealing)",
+        "markdown",
+    )
+)
+cells.append(
+    cell("""
 import torch, torch.nn.functional as F
 
 DISTILL_TOP_K = 4096     # sparse KL: only top-4096 tokens (32x less memory than full vocab)
@@ -597,11 +704,15 @@ print("✅ Distillation loss functions ready")
 print(f"  Top-K sparse KL: K={DISTILL_TOP_K}")
 print(f"  Temperature   : {T_START:.1f} → {T_END:.1f} (cosine anneal)")
 print(f"  Alpha schedule: {ALPHA_WARMUP:.2f} → {ALPHA_PEAK:.2f} → {ALPHA_FINAL:.2f}")
-"""))
+""")
+)
 
 # ── SECTION 11: Checkpoint System ────────────────────────────────────────────
-cells.append(cell("## Section 11: Crash-Safe Checkpoint System (every 50 steps)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("## Section 11: Crash-Safe Checkpoint System (every 50 steps)", "markdown")
+)
+cells.append(
+    cell("""
 import torch, json, time
 from pathlib import Path
 from safetensors.torch import save_file as safetensors_save
@@ -733,11 +844,13 @@ def load_checkpoint(model, optimizers, scheduler, ckpt_path: Path):
     return meta["step"], meta.get("loss_history", []), meta.get("expert_stats", {}), meta.get("concept_stats", {})
 
 print("✅ Checkpoint system ready")
-"""))
+""")
+)
 
 # ── SECTION 12: Expert Monitoring ────────────────────────────────────────────
 cells.append(cell("## Section 12: Expert & Concept Monitoring", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 import torch
 from collections import defaultdict
 import math
@@ -841,11 +954,13 @@ concept_monitor = ConceptMonitor(num_concepts=args.num_concepts)
 
 print(f"✅ Expert monitor  : {args.n_layers} layers × {args.n_routed_experts} experts")
 print(f"✅ Concept monitor : {args.num_concepts} concept slots")
-"""))
+""")
+)
 
 # ── SECTION 13: OOM Recovery ─────────────────────────────────────────────────
 cells.append(cell("## Section 13: OOM Recovery + Accelerate Wrap", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 import torch, gc
 
 # Prepare model + optimizers with Accelerate (handles DDP, mixed precision)
@@ -879,11 +994,13 @@ def safe_forward(model, x_enc, x_dec):
 
 print("✅ Model wrapped with Accelerate (DDP + bf16)")
 print(f"   Model on: {next(model.parameters()).device}")
-"""))
+""")
+)
 
 # ── SECTION 14: Auto Resume ───────────────────────────────────────────────────
 cells.append(cell("## Section 14: Auto Resume", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 # ── Auto-resume from latest checkpoint ──────────────────────────────────────
 loss_history   = []
 expert_stats   = {}
@@ -912,11 +1029,18 @@ if N_PROC > 1:
     t = torch.tensor([START_STEP], dtype=torch.long, device=DEVICE)
     torch.distributed.broadcast(t, src=0)
     START_STEP = t.item()
-"""))
+""")
+)
 
 # ── SECTION 15: Full Training Loop ───────────────────────────────────────────
-cells.append(cell("## Section 15: Training Loop (Multi-Loss, Distillation, Monitoring)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell(
+        "## Section 15: Training Loop (Multi-Loss, Distillation, Monitoring)",
+        "markdown",
+    )
+)
+cells.append(
+    cell("""
 import torch, time, math
 from tqdm.auto import tqdm
 
@@ -945,12 +1069,20 @@ model.train()
 pbar = tqdm(range(START_STEP, MAX_STEPS), initial=START_STEP, total=MAX_STEPS,
             desc="Training", disable=not IS_MAIN)
 
-accum_steps = accelerator.gradient_accumulation_steps
-global_step = START_STEP
+accum_steps        = accelerator.gradient_accumulation_steps
+tokens_per_step    = BATCH_SIZE * SEQ_LEN * accum_steps * N_PROC  # tokens consumed per real optimizer step
+steps_since_ckpt   = 0
+total_tokens_seen  = 0
+global_step        = START_STEP
+
+# Warm up GPU memory tracking by touching a small tensor (avoids cold-read bias)
+if torch.cuda.is_available():
+    _ = torch.cuda.memory_allocated() / 1024**3
 
 for step in pbar:
     t0 = time.time()
     global_step = step
+    _CHECKPOINT_ON_KILL.update({"step": step, "dataset_idx": dataset_idx})
 
     # LR schedule
     lr_mult = scheduler.step(step)
@@ -1041,27 +1173,53 @@ for step in pbar:
     # ── Gradient clipping & optimizer step ──────────────────────────────────
     if accelerator.sync_gradients:
         grad_norm = clip_grad_global_norm(accelerator.unwrap_model(model), max_norm=1.0)
-        for opt in optimizers:
-            opt.step()
+
+        # NaN/Inf gradient guard — prevents silent loss divergence.
+        # If any param has NaN/Inf grad, zero everything and skip step.
+        _skip_step = False
+        for _p in accelerator.unwrap_model(model).parameters():
+            if _p.grad is not None and (torch.isnan(_p.grad).any() or torch.isinf(_p.grad).any()):
+                _skip_step = True
+                break
+        if _skip_step:
+            print(f"  ⚠️  NaN/Inf gradient at step {step} — skipping optimizer step")
+
+        if not _skip_step:
+            for opt in optimizers:
+                opt.step()
+            # Apply EMA bias updates for MoE routing (after each real step)
+            accelerator.unwrap_model(model).apply_pending_bias_updates()
+        else:
+            # Log NaN for post-hoc analysis
+            log_step({"step": step, "nan_gradient": True, "grad_norm": float('nan')})
+
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
-
-        # Apply EMA bias updates for MoE routing (after each real step)
-        accelerator.unwrap_model(model).apply_pending_bias_updates()
 
     # ── Logging ─────────────────────────────────────────────────────────────
     loss_history.append(total_loss_accum)
     step_time = time.time() - t0
+    total_tokens_seen += tokens_per_step
 
     if IS_MAIN:
         exp_s  = expert_monitor.stats()
         con_s  = concept_monitor.stats()
+        tokens_per_sec = tokens_per_step / max(step_time, 1e-6)
+
+        # GPU memory pressure (query once)
+        if torch.cuda.is_available() and step % 10 == 0:
+            _alloc = torch.cuda.memory_allocated() / 1024**3
+            _peak  = torch.cuda.max_memory_allocated() / 1024**3
+            _free  = torch.cuda.get_device_properties(0).total_memory / 1e9 - _alloc
+            _mem_str = f"{_alloc:.1f}G/{_free:.1f}G free"
+        else:
+            _mem_str = ""
 
         pbar.set_postfix({
             "loss"   : f"{total_loss_accum:.3f}",
             "kl"     : f"{kl_loss.item():.3f}",
-            "α"      : f"{alpha:.2f}",
-            "T"      : f"{T:.2f}",
+            "tok/s"  : f"{tokens_per_sec:,.0f}",
+            "mem"    : _mem_str or "",
             "ent"    : f"{exp_s['entropy_ratio']:.2f}",
             "dead_e" : exp_s['dead_experts'],
         })
@@ -1080,6 +1238,8 @@ for step in pbar:
                 "lr_mult"        : lr_mult,
                 "grad_norm"      : grad_norm if accelerator.sync_gradients else 0.0,
                 "step_time_s"    : step_time,
+                "tokens_per_sec" : tokens_per_sec,
+                "gpu_mem_gb"     : _alloc if torch.cuda.is_available() else 0,
                 "expert_stats"   : exp_s,
                 "concept_stats"  : con_s,
             })
@@ -1101,11 +1261,13 @@ for step in pbar:
             concept_monitor.reset()
 
 print("\\n✅ Training complete!")
-"""))
+""")
+)
 
 # ── SECTION 16: Validation ───────────────────────────────────────────────────
 cells.append(cell("## Section 16: Validation (Perplexity + Reasoning)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("""
 import torch, math
 
 model.eval()
@@ -1159,11 +1321,18 @@ print(f"\\nReasoning probe input : {test_prompt}")
 print(f"Reasoning probe output: {decoded}")
 
 model.train()
-"""))
+""")
+)
 
 # ── SECTION 17: Training Report & Plots ──────────────────────────────────────
-cells.append(cell("## Section 17: Training Report (Loss Curves, Expert Stats, Concept Stats)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell(
+        "## Section 17: Training Report (Loss Curves, Expert Stats, Concept Stats)",
+        "markdown",
+    )
+)
+cells.append(
+    cell("""
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -1256,11 +1425,17 @@ if losses:
     print(f"  Concept entropy  : {concept_ent[-1]:.3f}" if concept_ent else "")
     print(f"  Perplexity       : {ppl:.2f}" if ppl else "  Perplexity: N/A")
     print(f"{'='*45}")
-"""))
+""")
+)
 
 # ── SECTION 18: Kaggle Persistence ──────────────────────────────────────────
-cells.append(cell("## Section 18: Kaggle Dataset Export (Persistence Across Sessions)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell(
+        "## Section 18: Kaggle Dataset Export (Persistence Across Sessions)", "markdown"
+    )
+)
+cells.append(
+    cell("""
 import shutil, json, os
 from pathlib import Path
 
@@ -1326,11 +1501,15 @@ def export_for_kaggle(step: int, model, export_dir: Path):
 if IS_MAIN and loss_history:
     final_step = len(loss_history) + START_STEP
     export_for_kaggle(final_step, model, EXPORT_DIR)
-"""))
+""")
+)
 
 # ── SECTION 19: Final Export ─────────────────────────────────────────────────
-cells.append(cell("## Section 19: Final Export (SafeTensors + HuggingFace)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("## Section 19: Final Export (SafeTensors + HuggingFace)", "markdown")
+)
+cells.append(
+    cell("""
 import shutil, json
 from pathlib import Path
 from safetensors.torch import save_file as sf_save
@@ -1405,11 +1584,15 @@ base_model: google/gemma-4-12B
 
     print(f"\\n✅ Model ready for upload at: {hf_dir}")
     print(f"   To push: Uncomment HfApi section above")
-"""))
+""")
+)
 
 # ── SECTION 20: Ablation Runner ──────────────────────────────────────────────
-cells.append(cell("## Section 20: Ablation Runner (Auto-configure from results)", "markdown"))
-cells.append(cell("""
+cells.append(
+    cell("## Section 20: Ablation Runner (Auto-configure from results)", "markdown")
+)
+cells.append(
+    cell("""
 import json
 
 # ── Ablation results from project (ablation_results.jsonl) ───────────────────
@@ -1447,7 +1630,8 @@ print()
 # ]:
 #     combined = {**ABLATION_FLAGS, **variant_flags}
 #     # re-build model with combined flags and train for N_ABLATION_STEPS steps
-"""))
+""")
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NOTEBOOK JSON

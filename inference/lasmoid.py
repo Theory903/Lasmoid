@@ -5,19 +5,32 @@ Extracted from monolithic model.py during Phase 0 SOLiD refactoring.
 """
 
 import torch
+import contextlib
 
 # ── PyTorch checkpoint debug/symbolizer crash guard ────────────────────────────
 # Root cause: In Kaggle/Colab, `torch.utils.checkpoint._checkpoint_debug_enabled`
 # may be set to True by the environment, overriding `debug=False` and forcibly
 # activating LoggingTensorMode → capture_logs → symbolize_tracebacks (C ext)
-# → ValueError: stoi.  We neutralize it at import time and patch the C-ext
-# symbolizer as a belt-and-suspenders fallback.
+# → ValueError: stoi.
+#
+# Strategy:
+#   1. Monkey-patch set_checkpoint_debug_enabled to a permanent no-op so
+#      runtime re-enable by the platform is ignored.
+#   2. Directly force _checkpoint_debug_enabled = False (handles pre-existing True).
+#   3. Patch symbolize_tracebacks as a belt-and-suspenders fallback.
 try:
     import torch.utils.checkpoint as _cp
+    from contextlib import contextmanager as _ctxmgr
 
-    # 1. Neutralise any ambient global debug flag.
-    if hasattr(_cp, "set_checkpoint_debug_enabled"):
-        _cp.set_checkpoint_debug_enabled(None)
+    @_ctxmgr
+    def _noop_checkpoint_debug(enabled=None):
+        """Permanent no-op: prevents Kaggle/Colab from re-enabling the debug flag."""
+        yield
+
+    # 1. Replace the setter with a no-op (preserves context-manager interface).
+    _cp.set_checkpoint_debug_enabled = _noop_checkpoint_debug
+    # 2. Force the variable directly (handles any prior value including True).
+    _cp._checkpoint_debug_enabled = False
 except Exception:
     pass
 
