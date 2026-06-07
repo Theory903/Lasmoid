@@ -118,7 +118,7 @@ T schedule: cosine anneal 4.0→1.0 (captures more signal early)
 
 ### Run on Kaggle (Recommended — Free T4 x2)
 
-1. Go to `notebooks/distillation/lasmoid_distill_gemma4_12B_kaggle.ipynb`
+1. Go to `notebooks/distillation/lasmoid_kaggle_v3.ipynb`
 2. Import to Kaggle, set **T4 x2** accelerator
 3. Add `HF_TOKEN` secret
 4. Run All

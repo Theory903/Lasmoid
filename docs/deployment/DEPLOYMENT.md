@@ -28,7 +28,7 @@ Cloud and local deployment reference.
 ### Steps
 
 1. Import notebook from GitHub:
-   - `notebooks/distillation/lasmoid_distill_gemma4_12B_kaggle.ipynb`
+   - `notebooks/distillation/lasmoid_kaggle_v3.ipynb`
 2. Settings → Accelerator → **GPU T4 x2**
 3. Add-ons → Secrets → `HF_TOKEN`
 4. Run All
@@ -183,5 +183,5 @@ snapshot_download("Theory903/lasmoid-100m", local_dir="checkpoints/hf/")
 | `config_100m.json` | `configs/model/config_100m.json` |
 | `generation_config.json` | `configs/generation_config.json` |
 | `tokenizer_config.json` | `configs/tokenizer/tokenizer_config.json` |
-| `lasmoid_distill_gemma4_12B_kaggle.ipynb` | `notebooks/distillation/lasmoid_distill_gemma4_12B_kaggle.ipynb` |
+| `lasmoid_kaggle_v3.ipynb` | `notebooks/distillation/lasmoid_kaggle_v3.ipynb` |
 | `input.txt` | `datasets/input.txt` |

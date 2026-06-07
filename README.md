@@ -115,7 +115,7 @@ Lasmoid/
 │
 ├── notebooks/                   ← Jupyter notebooks
 │   ├── distillation/
-│   │   └── lasmoid_distill_gemma4_12B_kaggle.ipynb   ← 🔥 Gemma-4 KD (Kaggle T4 x2)
+│   │   └── lasmoid_kaggle_v3.ipynb                   ← 🔥 Gemma-4 KD (Kaggle T4 x2)
 │   ├── training/
 │   │   ├── lasmoid_kaggle_train_100m.ipynb            ← 100M pretraining (Kaggle)
 │   │   ├── lasmoid_kaggle_train_10m.ipynb             ← 10M pretraining (Kaggle)
@@ -154,7 +154,7 @@ Lasmoid/
 
 ### Training on Kaggle (Free T4 x2)
 
-Open `notebooks/distillation/lasmoid_distill_gemma4_12B_kaggle.ipynb` on Kaggle.
+Open `notebooks/distillation/lasmoid_kaggle_v3.ipynb` on Kaggle.
 
 Requirements:
 1. Enable **T4 x2 GPU** in Notebook Settings
