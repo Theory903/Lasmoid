@@ -617,6 +617,11 @@ class Lasmoid(nn.Module):
         self.last_moe_loss = total_z_loss
         self.last_vq_loss = total_vq_loss
         self.last_pred_loss = sum(layer.last_pred_loss for layer in self.layers)
+        self.last_confidences = []
+
+        h_final = self._hc_head_reduce(streams)
+        h_normed = self.decoder_norm(h_final)
+
         if self.training and hasattr(self, "memory") and self.memory is not None:
             try:
                 cb = self.memory.concept_blocks[0].vqs[0].embedding.weight
@@ -636,10 +641,6 @@ class Lasmoid(nn.Module):
         else:
             token_concept = torch.tensor(0.0, device=x_dec.device, dtype=torch.float32)
         self.last_token_concept_loss = token_concept
-        self.last_confidences = []
-
-        h_final = self._hc_head_reduce(streams)
-        h_normed = self.decoder_norm(h_final)
 
         # Predict attributes for the sequence from final representations
         self.last_predicted_attributes = self.superhuman_alignment_head(h_normed)
