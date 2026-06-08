@@ -124,17 +124,24 @@ def pretrain():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=2.5e-4)
     parser.add_argument("--grad_accum", type=int, default=1)
-    parser.add_argument("--warmup_steps", type=int, default=10, help="Typically 2% of pretraining steps")
-    parser.add_argument("--stable_steps", type=int, default=80, help="Typically 90% of pretraining steps")
-    parser.add_argument("--decay_steps", type=int, default=10, help="Typically 8% of pretraining steps")
+    parser.add_argument("--warmup_steps", type=int, default=10, help="Typically 2%% of pretraining steps")
+    parser.add_argument("--stable_steps", type=int, default=80, help="Typically 90%% of pretraining steps")
+    parser.add_argument("--decay_steps", type=int, default=10, help="Typically 8%% of pretraining steps")
     parser.add_argument("--save_interval", type=int, default=50)
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/pretrain")
     parser.add_argument("--expert_dtype", type=str, default="nvfp4", choices=["bf16", "fp8", "nvfp4"])
+    parser.add_argument("--hf_repo", type=str, default=None, help="Hugging Face repo ID to upload checkpoints")
     args_cli = parser.parse_args()
 
     device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Pretrain] Running on device: {device.upper()}")
     os.makedirs(args_cli.checkpoint_dir, exist_ok=True)
+
+    # Initialize Hugging Face Uploader
+    hf_uploader = None
+    if args_cli.hf_repo:
+        from hf_uploader import HFAnyUploader
+        hf_uploader = HFAnyUploader(repo_id=args_cli.hf_repo)
 
     # 1. Load config
     lasmoid_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -272,11 +279,24 @@ def pretrain():
             ckpt_path = os.path.join(args_cli.checkpoint_dir, f"lasmoid_pretrain_{step}.pt")
             torch.save(model.state_dict(), ckpt_path)
             print(f"[Pretrain] Checkpoint saved: {ckpt_path}")
+            if hf_uploader:
+                hf_uploader.upload_file_async(
+                    file_path=ckpt_path,
+                    path_in_repo=f"checkpoints/lasmoid_pretrain_{step}.pt",
+                    commit_message=f"Pretrain checkpoint at step {step}"
+                )
 
     # Save final model
     final_path = os.path.join(args_cli.checkpoint_dir, "lasmoid_pretrain_final.pt")
     torch.save(model.state_dict(), final_path)
     print(f"[Pretrain] Pretraining completed successfully. Weights saved: {final_path}")
+    if hf_uploader:
+        hf_uploader.upload_file_async(
+            file_path=final_path,
+            path_in_repo="lasmoid_pretrain_final.pt",
+            commit_message="Final pretrained weights"
+        )
+        hf_uploader.wait_for_uploads()
 
 
 if __name__ == "__main__":

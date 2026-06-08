@@ -103,6 +103,12 @@ def train():
         default=None,
         help="Path or HuggingFace identifier for the tokenizer",
     )
+    parser.add_argument(
+        "--hf_repo",
+        type=str,
+        default=None,
+        help="Hugging Face repo ID to upload checkpoints (e.g. username/repo)",
+    )
     args_cli = parser.parse_args()
 
     # DDP Distributed Bootstrapping
@@ -144,6 +150,12 @@ def train():
     # Setup Checkpoint Directory
     if master_process:
         os.makedirs(args_cli.checkpoint_dir, exist_ok=True)
+
+    # Initialize Hugging Face Uploader
+    hf_uploader = None
+    if master_process and args_cli.hf_repo:
+        from hf_uploader import HFAnyUploader
+        hf_uploader = HFAnyUploader(repo_id=args_cli.hf_repo)
 
     # Load Tokenizer (Hugging Face or Local Fast tokenizer)
     lasmoid_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -688,6 +700,12 @@ def train():
                     ckpt_path,
                 )
                 print(f"Checkpoint saved to {ckpt_path}")
+                if hf_uploader:
+                    hf_uploader.upload_file_async(
+                        file_path=ckpt_path,
+                        path_in_repo=f"checkpoints/lasmoid_step_{step}.pt",
+                        commit_message=f"Checkpoint at step {step}"
+                    )
                 # ── Debug persistence ────────────────────────────────
                 write_debug_jsonl()
                 visualize_compression_patterns()
@@ -701,6 +719,13 @@ def train():
             )
             torch.save(raw_model.state_dict(), interrupted_path)
             print(f"Interrupted weights saved to {interrupted_path}")
+            if hf_uploader:
+                hf_uploader.upload_file_async(
+                    file_path=interrupted_path,
+                    path_in_repo="lasmoid_interrupted.pt",
+                    commit_message="Training interrupted by user"
+                )
+                hf_uploader.wait_for_uploads()
         if ddp:
             dist.destroy_process_group()
         sys.exit(0)
@@ -710,6 +735,13 @@ def train():
         final_path = os.path.join(args_cli.checkpoint_dir, "lasmoid_final.pt")
         torch.save(raw_model.state_dict(), final_path)
         print(f"Final model parameters saved to {final_path}")
+        if hf_uploader:
+            hf_uploader.upload_file_async(
+                file_path=final_path,
+                path_in_repo="lasmoid_final.pt",
+                commit_message="Final trained weights"
+            )
+            hf_uploader.wait_for_uploads()
 
     # Distributed Clean up
     if ddp:

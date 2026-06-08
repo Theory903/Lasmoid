@@ -191,11 +191,18 @@ def main():
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/extension")
+    parser.add_argument("--hf_repo", type=str, default=None, help="Hugging Face repo ID to upload checkpoints")
     args_cli = parser.parse_args()
 
     device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Extension] Running on device: {device.upper()}")
     os.makedirs(args_cli.checkpoint_dir, exist_ok=True)
+
+    # Initialize Hugging Face Uploader
+    hf_uploader = None
+    if args_cli.hf_repo:
+        from hf_uploader import HFAnyUploader
+        hf_uploader = HFAnyUploader(repo_id=args_cli.hf_repo)
 
     # Load Model
     with open(args_cli.config) as f:
@@ -314,7 +321,15 @@ def main():
         ckpt_path = os.path.join(args_cli.checkpoint_dir, f"lasmoid_stage_{seq_len}.pt")
         torch.save(model.state_dict(), ckpt_path)
         print(f"[Extension] Saved Stage {seq_len} checkpoint: {ckpt_path}")
+        if hf_uploader:
+            hf_uploader.upload_file_async(
+                file_path=ckpt_path,
+                path_in_repo=f"checkpoints/lasmoid_stage_{seq_len}.pt",
+                commit_message=f"Finetune stage {seq_len} checkpoint"
+            )
 
+    if hf_uploader:
+        hf_uploader.wait_for_uploads()
     print("\n[Extension] All progressive length extension stages completed successfully.")
 
 

@@ -166,6 +166,12 @@ def parse_args():
         default=None,
         help="Path to precomputed teacher logits (.pt). If set, uses offline teacher.",
     )
+    p.add_argument(
+        "--hf_repo",
+        type=str,
+        default=None,
+        help="Hugging Face repo ID to upload checkpoints (e.g. username/repo)",
+    )
 
     return p.parse_args()
 
@@ -353,6 +359,7 @@ def save_checkpoint(
     ckpt_dir: Path = None,
     is_main: bool = True,
     unwrapped=None,
+    hf_uploader=None,
 ):
     if not is_main:
         return
@@ -416,6 +423,28 @@ def save_checkpoint(
         pass
 
     print(f"  💾 Checkpoint saved: step {step} → {ckpt_path.name}")
+
+    if hf_uploader:
+        # Copy configuration and tokenizer files to make the checkpoint directory self-contained
+        import shutil
+        try:
+            config_src = _PROJECT_ROOT / "config.json"
+            if not config_src.exists():
+                config_src = _PROJECT_ROOT / "configs/model/config_gemma4_10m.json"
+            if config_src.exists():
+                shutil.copy(str(config_src), str(ckpt_path / "config.json"))
+            for fname in ["tokenizer.json", "tokenizer_config.json"]:
+                src = _PROJECT_ROOT / fname
+                if src.exists():
+                    shutil.copy(str(src), str(ckpt_path / fname))
+        except Exception as e:
+            print(f"  ⚠️ Failed to copy config/tokenizer files to checkpoint: {e}")
+
+        hf_uploader.upload_folder_async(
+            folder_path=ckpt_path,
+            path_in_repo=f"checkpoints/step_{step:06d}",
+            commit_message=f"Checkpoint at step {step}"
+        )
 
 
 def find_latest_checkpoint(ckpt_dir: Path) -> Optional[Path]:
@@ -487,6 +516,7 @@ def _shutdown_handler(
     dataset_idx=0,
     is_main=True,
     unwrapped=None,
+    hf_uploader=None,
 ):
     sig_name = signal.Signals(signum).name
     print(f"\n⚠️  Received {sig_name} — saving emergency checkpoint...")
@@ -505,8 +535,11 @@ def _shutdown_handler(
             ckpt_dir=ckpt_dir,
             is_main=True,
             unwrapped=unwrapped,
+            hf_uploader=hf_uploader,
         )
         print(f"  💾 Emergency checkpoint saved at step {step}")
+    if hf_uploader:
+        hf_uploader.wait_for_uploads()
     print("Exiting gracefully.")
     exit(0)
 
@@ -545,6 +578,12 @@ def train():
 
     global CURSOR_FILE
     CURSOR_FILE = ckpt_dir / "cursor.json"
+
+    # Hugging Face Uploader
+    hf_uploader = None
+    if is_main and args.hf_repo:
+        from hf_uploader import HFAnyUploader
+        hf_uploader = HFAnyUploader(repo_id=args.hf_repo)
 
     # ── GPU info ──────────────────────────────────────────────────────────────
     if torch.cuda.is_available() and is_main:
@@ -715,6 +754,7 @@ def train():
             dataset_idx=0,
             is_main=True,
             unwrapped=accelerator.unwrap_model(model),
+            hf_uploader=hf_uploader,
         )
         signal.signal(signal.SIGTERM, _make_handler(**shutdown_ctx))
         signal.signal(signal.SIGINT, _make_handler(**shutdown_ctx))
@@ -951,6 +991,7 @@ def train():
                     ckpt_dir=ckpt_dir,
                     is_main=True,
                     unwrapped=_unwrapped,
+                    hf_uploader=hf_uploader,
                 )
                 expert_monitor.reset()
                 concept_monitor.reset()
@@ -974,7 +1015,10 @@ def train():
             ckpt_dir=ckpt_dir,
             is_main=True,
             unwrapped=_unwrapped,
+            hf_uploader=hf_uploader,
         )
+        if hf_uploader:
+            hf_uploader.wait_for_uploads()
         _run_validation(model, tokenizer, args, device, _unwrapped)
 
 
