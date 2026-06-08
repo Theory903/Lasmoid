@@ -134,6 +134,7 @@ class EnhancedEventDetector(nn.Module):
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         """Returns multi-scale boundary probability: [B, S, 1], already softplus'd.
         NOTE: Context-dependent — use cif_boundary_score() for CIF fire logic."""
+        h = h.to(self.local_proj.weight.dtype)
         local = self.local_proj(h)  # [B, S, 1]
         window_feat = self.window_conv(h.transpose(1, 2)).transpose(
             1, 2
@@ -142,12 +143,13 @@ class EnhancedEventDetector(nn.Module):
         global_scores, _ = self.global_attn(h, h, h)  # [B, S, dim]
         global_scores = global_scores.mean(dim=-1, keepdim=True)  # [B, S, 1]
         combined = torch.cat([local, window, global_scores], dim=-1)  # [B, S, 3]
-        return F.softplus(self.fusion(combined))  # [B, S, 1]
+        return F.softplus(self.fusion(combined.to(self.fusion.weight.dtype)))  # [B, S, 1]
 
     def cif_boundary_score(self, h: torch.Tensor) -> torch.Tensor:
         """Context-independent per-token CIF boundary score: [B, S, 1].
         Uses only per-token features (no conv/attention) so that AR mode
         produces identical scores to parallel mode for the same token."""
+        h = h.to(self.cif_score.weight.dtype)
         return F.softplus(self.cif_score(h))  # [B, S, 1]
 
 

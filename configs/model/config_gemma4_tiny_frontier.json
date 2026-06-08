@@ -63,15 +63,17 @@
   "use_relational_cortex": false,
   "use_curiosity_expert": false,
   "use_gvq": false,
-  "use_einsum": false,
+  "use_einsum": true,
   "use_block_attnres": false,
   "use_ring_attention": false,
-  "use_fp8_kv": false,
+  "use_fp8_kv": true,
   "use_turboquant": false,
-  "use_kv_eviction": false,
-  "use_compaction": false,
+  "use_kv_eviction": true,
+  "use_compaction": true,
   "use_mxfp4_weights": false,
   "moe_adaptive_routing": false,
   "stability_enabled": false,
-  "mtp_speculation_enabled": false
+  "mtp_speculation_enabled": false,
+  "frac_shared_layers": 0.5,
+  "use_associative_scan": true
 }
