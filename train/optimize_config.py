@@ -19,7 +19,7 @@ def get_params_for_args(args):
 def optimize():
     # Base configuration template matching our config.json structure
     base_config = {
-        "vocab_size": 129286,
+        "vocab_size": 129280,
         "max_seq_len": 512,  # Expand sequence length for longer context reasoning
         "max_batch_size": 4,
         "dtype": "bf16",

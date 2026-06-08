@@ -391,7 +391,7 @@ assumptions. (Req 20.1–20.5)
 ### Configuration (`Tiny_Config` = `config_100m.json`)
 
 Key fields the harness reads (verified present): `dim: 384`, `n_layers: 12`,
-`n_heads: 6`, `head_dim: 48`, `vocab_size: 129286`, `max_seq_len: 512`,
+`n_heads: 6`, `head_dim: 48`, `vocab_size: 129280`, `max_seq_len: 512`,
 `max_batch_size: 4`, `dtype: bf16`, `norm_eps: 1e-6`, `rope_theta: 10000.0`,
 `original_seq_len: 0` (YaRN bypass note above), `num_residual_streams: 4`,
 `hc_sinkhorn_iters: 8`, `n_routed_experts: 6`, `n_shared_experts: 1`,

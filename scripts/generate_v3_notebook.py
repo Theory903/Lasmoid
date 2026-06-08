@@ -382,7 +382,7 @@ def tokenizer_analysis(tokenizer, sample_texts: list, top_n: int = 50) -> dict:
     print(f"  Dead tokens      : {vocab_sz - n_unique:,}  ({100*dead_frac:.1f}%)")
     print(f"  Chars/token (↑=better compression): {compress:.2f}")
 
-    # ⚠️ For 100M model: embedding table = vocab_size × dim = 129286 × 384 = 49.6M params
+    # ⚠️ For 100M model: embedding table = vocab_size × dim = 129280 × 384 = 49.6M params
     # = ~50% of model capacity just in embeddings!
     embed_params = vocab_sz * 384  # 100M config dim
     print(f"\\n  ⚠️  Embedding table: {embed_params/1e6:.1f}M params")

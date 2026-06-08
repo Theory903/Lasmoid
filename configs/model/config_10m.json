@@ -1,5 +1,5 @@
 {
-  "vocab_size": 129286,
+  "vocab_size": 129280,
   "max_seq_len": 128,
   "max_batch_size": 64,
   "dtype": "bf16",

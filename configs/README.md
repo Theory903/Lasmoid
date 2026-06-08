@@ -29,7 +29,7 @@ All model configuration files live in `configs/model/`. Each JSON file is a full
 | `n_layers` | int | 12 | Number of transformer blocks |
 | `n_heads` | int | 6 | Number of attention heads (Q) |
 | `head_dim` | int | 48 | Dimension per attention head |
-| `vocab_size` | int | 129286 | Vocabulary size (BPE tokenizer) |
+| `vocab_size` | int | 129280 | Vocabulary size (BPE tokenizer) |
 | `max_seq_len` | int | 512 | Maximum sequence length |
 | `max_batch_size` | int | 4 | Maximum batch size for KV cache |
 | `dtype` | str | "bf16" | Compute dtype (`bf16` or `fp32`) |
@@ -135,7 +135,7 @@ All model configuration files live in `configs/model/`. Each JSON file is a full
   "n_layers": 12,
   "n_heads": 6,
   "head_dim": 48,
-  "vocab_size": 129286,
+  "vocab_size": 129280,
   "max_seq_len": 512,
   "n_routed_experts": 6,
   "n_activated_experts": 2,

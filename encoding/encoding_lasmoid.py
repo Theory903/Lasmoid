@@ -52,7 +52,7 @@ VALID_TASKS = set(LASMOID_TASK_SP_TOKENS.keys())
 @dataclass(frozen=True)
 class TokenizerProfile:
     """Tokenizer contract expected by Lasmoid prompt encoding."""
-    vocab_size: int = 129286
+    vocab_size: int = 129280
     model_max_length: int = 1048576
     bos_token: str = bos_token
     eos_token: str = eos_token
