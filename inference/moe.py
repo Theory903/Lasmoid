@@ -64,7 +64,9 @@ class Gate(nn.Module):
         self.pending_bias_updates = []
 
         # ── Domain Cortex (brain-like sparse activation over scientific domains) ──
-        self.use_domain_cortex = getattr(args, "use_domain_cortex", False) and not self.use_hash
+        self.use_domain_cortex = (
+            getattr(args, "use_domain_cortex", False) and not self.use_hash
+        )
         if self.use_domain_cortex:
             self.cortex = DomainCortexRouter(
                 dim=args.dim,
@@ -180,7 +182,9 @@ class Gate(nn.Module):
             expert_mask, _domain_probs, _domain_idx, cortex_aux = self.cortex(
                 router_input, domain_steer=domain_steer
             )
-            scores_for_choice = scores_for_choice.masked_fill(~expert_mask, float("-inf"))
+            scores_for_choice = scores_for_choice.masked_fill(
+                ~expert_mask, float("-inf")
+            )
             self.last_cortex_aux = cortex_aux
             self.last_expert_mask = expert_mask
         else:
@@ -293,7 +297,9 @@ class DeepSeekMoE(nn.Module):
         self.router_z_loss_coeff = getattr(args, "router_z_loss_coeff", 0.001)
         self.router_entropy_coeff = getattr(args, "moe_router_entropy_coeff", 0.001)
         self.capacity_loss_coeff = getattr(args, "moe_capacity_loss_coeff", 0.01)
-        self.cortex_load_balance_coeff = getattr(args, "cortex_load_balance_coeff", 0.01)
+        self.cortex_load_balance_coeff = getattr(
+            args, "cortex_load_balance_coeff", 0.01
+        )
 
         self.gate = Gate(0, args)
 
@@ -358,7 +364,9 @@ class DeepSeekMoE(nn.Module):
         self._saved_sel = {}
         self._saved_w = {}
 
-    def _adaptive_select(self, probs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _adaptive_select(
+        self, probs: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Top-p (nucleus) variable-k expert selection per token.
 
         Selects a variable number of experts per token via nucleus (top-p)
@@ -394,13 +402,18 @@ class DeepSeekMoE(nn.Module):
         return sel, w
 
     def _adaptive_forward(
-        self, x: torch.Tensor, domain_steer: Optional[torch.Tensor] = None, r_step: int = 0
+        self,
+        x: torch.Tensor,
+        domain_steer: Optional[torch.Tensor] = None,
+        r_step: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         shape = x.shape
         flat_x = x.reshape(-1, self.dim)
         N_tokens = flat_x.shape[0]
 
-        _w, _idx, z_loss, router_probs = self.gate(flat_x, None, domain_steer=domain_steer, r_step=r_step)
+        _w, _idx, z_loss, router_probs = self.gate(
+            flat_x, None, domain_steer=domain_steer, r_step=r_step
+        )
         probs = router_probs.float()
         if self.gate.last_expert_mask is not None:
             probs = probs.masked_fill(~self.gate.last_expert_mask, 0.0)
@@ -430,9 +443,13 @@ class DeepSeekMoE(nn.Module):
                 # routing_fraction: fraction of tokens each expert serves,
                 # normalized by the mean expert count per token for fairness.
                 avg_k = sel.float().sum(dim=1).mean().item()
-                routing_fraction = counts / (total_tokens * max(avg_k, 1.0) / self.n_routed)
+                routing_fraction = counts / (
+                    total_tokens * max(avg_k, 1.0) / self.n_routed
+                )
                 target_fraction = 1.0 / self.n_routed
-                bias_update = self.gate.ema_bias_lr * (target_fraction - routing_fraction)
+                bias_update = self.gate.ema_bias_lr * (
+                    target_fraction - routing_fraction
+                )
                 self.gate.pending_bias_updates.append(bias_update)
 
         base_x = self.w_down(flat_x) if self.use_latent else flat_x
@@ -446,7 +463,10 @@ class DeepSeekMoE(nn.Module):
             exp_out = exp(base_x[tok_idx], w[tok_idx, i, None])
             if self.training and self.expert_dropout_p > 0.0:
                 keep = (
-                    (torch.rand(exp_out.shape[0], device=exp_out.device) > self.expert_dropout_p)
+                    (
+                        torch.rand(exp_out.shape[0], device=exp_out.device)
+                        > self.expert_dropout_p
+                    )
                     .float()
                     .unsqueeze(-1)
                 )
@@ -472,7 +492,9 @@ class DeepSeekMoE(nn.Module):
         Pi = router_probs.float().mean(dim=0)
         load_balance_loss = self.n_routed * (fi * Pi).sum()
         router_entropy = (
-            -(router_probs.float() * torch.log(router_probs.float() + 1e-8)).sum(dim=-1).mean()
+            -(router_probs.float() * torch.log(router_probs.float() + 1e-8))
+            .sum(dim=-1)
+            .mean()
         )
         router_entropy_loss = -router_entropy / math.log(max(2, self.n_routed))
         avg_experts = sel.float().sum(dim=1).mean()  # mean experts recruited per token
@@ -494,7 +516,10 @@ class DeepSeekMoE(nn.Module):
         return y.reshape(shape), aux
 
     def forward(
-        self, x: torch.Tensor, domain_steer: Optional[torch.Tensor] = None, r_step: int = 0
+        self,
+        x: torch.Tensor,
+        domain_steer: Optional[torch.Tensor] = None,
+        r_step: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.adaptive_routing:
             return self._adaptive_forward(x, domain_steer, r_step=r_step)
@@ -502,7 +527,9 @@ class DeepSeekMoE(nn.Module):
         flat_x = x.reshape(-1, self.dim)
         N_tokens = flat_x.shape[0]
 
-        weights, indices, z_loss, router_probs = self.gate(flat_x, None, domain_steer=domain_steer, r_step=r_step)
+        weights, indices, z_loss, router_probs = self.gate(
+            flat_x, None, domain_steer=domain_steer, r_step=r_step
+        )
 
         # ── Expert capacity: max tokens each expert can receive ──────
         # capacity = ceil(capacity_factor * tokens / n_experts * n_activated)
@@ -543,11 +570,10 @@ class DeepSeekMoE(nn.Module):
         # ── Forward through experts ───────────────────────────────────
         base_x = self.w_down(flat_x) if self.use_latent else flat_x
         y = torch.zeros_like(base_x, dtype=torch.float32)
-        counts = torch.bincount(indices.flatten(), minlength=self.n_routed).tolist()
 
-        for i, exp in enumerate(self.experts):
-            if counts[i] == 0:
-                continue
+        for i in torch.unique(indices):
+            i = i.item()
+            exp = self.experts[i]
             tok_idx, top_pos = torch.where(indices == i)
             # Token-dropping: only process up to capacity
             if tok_idx.shape[0] > capacity:
@@ -607,7 +633,9 @@ class DeepSeekMoE(nn.Module):
         """Quantize routed expert weights to simulated NVFP4 E2M1 format in-place."""
         for expert in self.experts:
             for linear_layer in [expert.w1, expert.w3, expert.w2]:
-                q_weight, scale = quantize_weight_to_nvfp4(linear_layer.weight.data, block_size=32)
+                q_weight, scale = quantize_weight_to_nvfp4(
+                    linear_layer.weight.data, block_size=32
+                )
                 linear_layer.weight.data.copy_(q_weight)
                 linear_layer.scale = nn.Parameter(scale, requires_grad=False)
                 linear_layer.weight.use_fp4_weights = True
@@ -617,16 +645,24 @@ class DeepSeekMoE(nn.Module):
         """Quantize routed expert weights to FP8 E4M3 format in-place."""
         for expert in self.experts:
             for linear_layer in [expert.w1, expert.w3, expert.w2]:
-                q_weight, scale = quantize_weight_to_fp8(linear_layer.weight.data, block_size=128)
-                linear_layer.weight = nn.Parameter(q_weight, requires_grad=linear_layer.weight.requires_grad)
+                q_weight, scale = quantize_weight_to_fp8(
+                    linear_layer.weight.data, block_size=128
+                )
+                linear_layer.weight = nn.Parameter(
+                    q_weight, requires_grad=linear_layer.weight.requires_grad
+                )
                 linear_layer.scale = nn.Parameter(scale, requires_grad=False)
                 linear_layer.weight.scale = linear_layer.scale
 
     def quantize_shared_expert_to_fp8(self) -> None:
         """Quantize shared expert weights to FP8 E4M3 format in-place."""
         for linear_layer in [self.shared.w1, self.shared.w3, self.shared.w2]:
-            q_weight, scale = quantize_weight_to_fp8(linear_layer.weight.data, block_size=128)
-            linear_layer.weight = nn.Parameter(q_weight, requires_grad=linear_layer.weight.requires_grad)
+            q_weight, scale = quantize_weight_to_fp8(
+                linear_layer.weight.data, block_size=128
+            )
+            linear_layer.weight = nn.Parameter(
+                q_weight, requires_grad=linear_layer.weight.requires_grad
+            )
             linear_layer.scale = nn.Parameter(scale, requires_grad=False)
             linear_layer.weight.scale = linear_layer.scale
 
@@ -648,8 +684,22 @@ def quantize_weight_to_nvfp4(
     s_flat = torch.pow(2.0, torch.ceil(torch.log2(amax / fp4_max)))
 
     fp4_vals = [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
     ]
     fp4_values = torch.tensor(fp4_vals, device=weight.device, dtype=torch.float32)
     scaled = (w_flat / s_flat).clamp(-fp4_max, fp4_max)
@@ -657,7 +707,9 @@ def quantize_weight_to_nvfp4(
     y_fp4 = fp4_values[dist.argmin(-1)]
 
     quantized_weight = y_fp4.reshape(shape).to(weight.dtype)
-    scale = s_flat.reshape(out_features, in_features // actual_block_size).to(weight.dtype)
+    scale = s_flat.reshape(out_features, in_features // actual_block_size).to(
+        weight.dtype
+    )
     return quantized_weight, scale
 
 
@@ -671,4 +723,3 @@ def quantize_weight_to_fp8(
         from kernel import act_quant
     y_out, s_out = act_quant(weight.contiguous(), block_size=block_size)
     return y_out, s_out
-

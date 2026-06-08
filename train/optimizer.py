@@ -200,7 +200,15 @@ def build_optimizers(
     if adamw_n:
         adam_groups.append({"params": adamw_n, "weight_decay": 0.0})
     if adam_groups:
-        opts.append(torch.optim.AdamW(adam_groups, lr=adamw_lr, betas=betas, eps=eps))
+        opts.append(
+            torch.optim.AdamW(
+                adam_groups,
+                lr=adamw_lr,
+                betas=betas,
+                eps=eps,
+                fused=True if torch.cuda.is_available() else False,
+            )
+        )
     return opts
 
 
