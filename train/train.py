@@ -14,6 +14,15 @@ import argparse
 import urllib.request
 import json
 import torch
+import warnings
+
+# Monkey-patch torch.bf16 for compatibility with older/custom PyTorch versions in transformers
+if not hasattr(torch, "bf16"):
+    torch.bf16 = torch.bfloat16
+
+# Suppress incorrect regex warnings from tokenizers at runtime
+warnings.filterwarnings("ignore", message=".*incorrect regex pattern.*")
+
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
