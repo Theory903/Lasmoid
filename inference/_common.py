@@ -87,7 +87,7 @@ class RMSNorm(nn.Module):
 def _linear_dispatch(
     x: torch.Tensor, weight: nn.Parameter, bias: Optional[nn.Parameter] = None
 ) -> torch.Tensor:
-    if weight.dtype == torch.bfloat16 or weight.dtype == torch.float32:
+    if weight.dtype in (torch.bfloat16, torch.float16, torch.float32):
         if getattr(weight, "use_fp4_weights", False):
             out = fp4_gemm(x, None, weight, getattr(weight, "scale", None)).to(x.dtype)
             if bias is not None:
@@ -150,7 +150,7 @@ class Linear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
             _use_einsum
-            and self.weight.dtype in (torch.bfloat16, torch.float32)
+            and self.weight.dtype in (torch.bfloat16, torch.float16, torch.float32)
             and not getattr(self.weight, "use_fp4_weights", False)
         ):
             # Einsum path (Gemma-4): weight is (out, in), use '...d,od->...o'

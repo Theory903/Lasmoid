@@ -333,7 +333,7 @@ class Lasmoid(nn.Module):
         external_embeddings: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Embed token ids and optionally fuse aligned external embeddings."""
-        token_emb = self.emb(token_ids).to(torch.bfloat16)
+        token_emb = self.emb(token_ids).to(self.emb.weight.dtype)
         if external_embeddings is None:
             return token_emb
         if self.external_embedding_proj is None:
@@ -351,9 +351,9 @@ class Lasmoid(nn.Module):
                 f"expected {self.args.external_embedding_dim}"
             )
 
-        ext = external_embeddings.to(device=token_ids.device, dtype=torch.bfloat16)
+        ext = external_embeddings.to(device=token_ids.device, dtype=self.emb.weight.dtype)
         if self.args.external_embedding_norm:
-            ext = F.normalize(ext.float(), dim=-1, eps=1e-6).to(torch.bfloat16)
+            ext = F.normalize(ext.float(), dim=-1, eps=1e-6).to(self.emb.weight.dtype)
         ext = self.external_embedding_proj(ext)
         if self.external_embedding_norm is not None:
             ext = self.external_embedding_norm(ext)
@@ -369,7 +369,7 @@ class Lasmoid(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # 1. Base text/external embedding
         fused_embeddings = self.embed_tokens(x_dec, external_embeddings).to(
-            torch.bfloat16
+            self.emb.weight.dtype
         )
         B, N_dec, dim = fused_embeddings.shape
 

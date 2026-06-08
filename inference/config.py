@@ -197,11 +197,11 @@ class RegularizationConfig:
 class QuantConfig:
     """Precision mapping configuration for post-training quantization."""
 
-    moe_route_dtype: Literal["bf16", "fp8", "nvfp4"] = "bf16"
-    moe_shared_dtype: Literal["bf16", "fp8"] = "bf16"
-    attn_proj_dtype: Literal["bf16", "fp8"] = "bf16"
-    kv_cache_dtype: Literal["bf16", "fp8"] = "bf16"
-    embed_dtype: Literal["bf16"] = "bf16"
+    moe_route_dtype: Literal["bf16", "fp16", "fp8", "nvfp4"] = "bf16"
+    moe_shared_dtype: Literal["bf16", "fp16", "fp8"] = "bf16"
+    attn_proj_dtype: Literal["bf16", "fp16", "fp8"] = "bf16"
+    kv_cache_dtype: Literal["bf16", "fp16", "fp8"] = "bf16"
+    embed_dtype: Literal["bf16", "fp16"] = "bf16"
     calib_size: int = 2000
 
 
@@ -216,7 +216,7 @@ class ModelArgs:
     n_layers: int = 4
     max_seq_len: int = 256
     max_batch_size: int = 4
-    dtype: Literal["bf16", "fp8"] = "bf16"
+    dtype: Literal["bf16", "fp16", "fp8"] = "bf16"
     scale_fmt: Optional[str] = None
     scale_dtype: Literal["fp32", "fp8"] = "fp32"
     expert_dtype: Optional[str] = None
