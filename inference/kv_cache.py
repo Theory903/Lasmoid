@@ -9,7 +9,10 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from config import ModelArgs
+try:
+    from .config import ModelArgs
+except ImportError:
+    from config import ModelArgs
 
 try:
     from .kernels.quant import KVQuantConfig, quantize_kv, dequantize_kv
