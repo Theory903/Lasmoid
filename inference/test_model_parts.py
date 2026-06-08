@@ -139,7 +139,7 @@ class TestLasmoidComponents(unittest.TestCase):
         ).to(self.device)
 
         # Test Prefill mode
-        kv_out, event_prob = compressor(x, start_pos=0)
+        kv_out, event_prob, fired_indices_tensor = compressor(x, start_pos=0)
         self.assertEqual(event_prob.shape, (2, 16, 1))
         self.assertEqual(kv_out.ndim, 3)
         self.assertEqual(kv_out.shape[0], 2)

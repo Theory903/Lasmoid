@@ -231,6 +231,7 @@ class Compressor(nn.Module):
             persistent=False,
         )
         self._saved_num_fires = {}
+        self.is_recompute = False
 
     def resize_buffers(self, bsz: int, device: Optional[torch.device] = None):
         if bsz > self.kv_accumulator.shape[0]:
@@ -265,6 +266,7 @@ class Compressor(nn.Module):
 
     def clear_saved_checkpoint_state(self):
         self._saved_num_fires = {}
+        self.is_recompute = False
 
     def forward(self, x: torch.Tensor, start_pos: int, r_step: int = 0):
         assert self.kv_cache is not None
@@ -342,13 +344,27 @@ class Compressor(nn.Module):
             num_complete_fires_dyn = max(
                 1, int(num_complete_fires_per_sample.max().item())
             )
-            num_complete_fires = num_complete_fires_dyn
+            
+            if self.training:
+                if not self.is_recompute:
+                    if r_step not in self._saved_num_fires:
+                        self._saved_num_fires[r_step] = []
+                    self._saved_num_fires[r_step].append(num_complete_fires_dyn)
+                    num_complete_fires = num_complete_fires_dyn
+                else:
+                    if r_step in self._saved_num_fires and len(self._saved_num_fires[r_step]) > 0:
+                        num_complete_fires = self._saved_num_fires[r_step].pop()
+                    else:
+                        num_complete_fires = num_complete_fires_dyn
+            else:
+                num_complete_fires = num_complete_fires_dyn
+
             if push_compressor_debug is not None:
                 push_compressor_debug(
                     layer_id=getattr(self, "layer_id", -1),
                     r_step=r_step,
                     training=self.training,
-                    saved_num_fires=None,
+                    saved_num_fires=self._saved_num_fires if self.training else None,
                     num_complete_fires_dyn=num_complete_fires_dyn,
                     num_complete_fires=num_complete_fires,
                 )

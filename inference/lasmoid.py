@@ -435,6 +435,11 @@ class Lasmoid(nn.Module):
             if hasattr(m, "clear_saved_checkpoint_state"):
                 m.clear_saved_checkpoint_state()
 
+    def set_recompute_flag(self, val: bool):
+        for m in self.modules():
+            if hasattr(m, "is_recompute"):
+                m.is_recompute = val
+
     def _hc_head_reduce(self, x: torch.Tensor) -> torch.Tensor:
         shape, dtype = x.size(), x.dtype
         B, S, hc, D = shape
@@ -473,7 +478,7 @@ class Lasmoid(nn.Module):
         List[torch.Tensor],
     ]:
         if self.training:
-            self.clear_saved_checkpoint_states()
+            self.set_recompute_flag(False)
             self.apply_pending_bias_updates()
 
         B, N_dec = x_dec.shape
@@ -699,6 +704,12 @@ class Lasmoid(nn.Module):
             )
             self.last_z_loss = self.last_z_loss + mtp_z
             self.last_vq_loss = self.last_vq_loss + mtp_vq
+
+        if self.training and logits.requires_grad:
+            def backward_hook(grad):
+                self.set_recompute_flag(True)
+                return grad
+            logits.register_hook(backward_hook)
 
         return (
             logits,
