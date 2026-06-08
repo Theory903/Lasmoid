@@ -28,16 +28,23 @@ def test_checkpointing():
     model.gradient_checkpointing = True
     
     # Generate dummy input
-    x = torch.randint(0, 32768, (2, 64))
+    x = torch.randint(0, 32768, (2, 1024))
     
-    print("Running forward pass...")
-    out = model(x, x)
-    logits = out[0]
-    loss = logits.float().mean()
+    print("Running forward passes for 4 micro-batches...")
+    losses = []
+    for i in range(4):
+        print(f"Micro-batch {i}...")
+        x = torch.randint(0, 32768, (2, 1024))
+        out = model(x, x)
+        logits = out[0]
+        loss = logits.float().mean() / 4.0
+        losses.append(loss)
     
-    print("Running backward pass...")
-    loss.backward()
-    print("Backward pass completed successfully!")
+    print("Running backward passes in reverse order (simulating autograd backward)...")
+    for i, loss in enumerate(reversed(losses)):
+        print(f"Backward for micro-batch {3 - i}...")
+        loss.backward(retain_graph=True)
+    print("Accumulation steps completed successfully!")
 
 if __name__ == "__main__":
     test_checkpointing()

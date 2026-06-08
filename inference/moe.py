@@ -230,12 +230,7 @@ class Gate(nn.Module):
             else:
                 indices_dyn = scores_for_choice.topk(self.topk, dim=-1)[1]
 
-        if self.training:
-            if r_step not in self._saved_indices:
-                self._saved_indices[r_step] = indices_dyn
-            indices = self._saved_indices[r_step]
-        else:
-            indices = indices_dyn
+        indices = indices_dyn
 
         if self.training and self.bias is not None:
             with torch.no_grad():
@@ -413,21 +408,8 @@ class DeepSeekMoE(nn.Module):
         # Always run the dynamic selection logic to build the exact same autograd graph in both passes
         sel_dyn, w_dyn = self._adaptive_select(probs)
 
-        if self.training:
-            if r_step not in self._saved_sel:
-                self._saved_sel[r_step] = sel_dyn
-            sel = self._saved_sel[r_step]
-            print(f"[MoE DEBUG] training={self.training}, r_step={r_step}, sel_dyn sum={sel_dyn.sum().item()}, saved_sel sum={sel.sum().item()}")
-            # Since sel is boolean, we compute w dynamically from probs and sel.
-            # This ensures that:
-            # 1. w matches the saved shape and content from the forward pass.
-            # 2. w maintains its dynamic gradient path with respect to probs.
-            w = probs * sel
-            w_sum = w.sum(dim=-1, keepdim=True)
-            w = w / (w_sum + 1e-8) * self.gate.route_scale
-        else:
-            sel = sel_dyn
-            w = w_dyn
+        sel = sel_dyn
+        w = w_dyn
 
         # ── Correct EMA bias for adaptive routing ────────────────────────
         # Gate.forward computed an EMA bias update based on its internal

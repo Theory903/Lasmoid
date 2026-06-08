@@ -602,21 +602,26 @@ class CSAAttention(Attention):
 
         # ── Run Compressor/Caching First if start_pos == 0 ──
         if start_pos == 0:
-            if seqlen <= win:
-                self.kv_cache[:bsz, :seqlen] = kv
-            else:
-                cutoff = seqlen % win
-                self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = kv[
-                    :, -win:
-                ].split([win - cutoff, cutoff], dim=1)
+            if not self.training:
+                if seqlen <= win:
+                    self.kv_cache[:bsz, :seqlen] = kv
+                else:
+                    cutoff = seqlen % win
+                    self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = kv[
+                        :, -win:
+                    ].split([win - cutoff, cutoff], dim=1)
             if self.compress_ratio:
                 compressor_out = self.compressor(x, start_pos, r_step=r_step)
                 if compressor_out is not None:
-                    if isinstance(compressor_out, tuple):
-                        kv_compress, event_prob = compressor_out
+                    if self.training:
+                        kv_compress, event_prob, fired_indices_tensor = compressor_out
                         self._last_event_prob = event_prob
                     else:
-                        kv_compress = compressor_out
+                        if isinstance(compressor_out, tuple):
+                            kv_compress, event_prob = compressor_out
+                            self._last_event_prob = event_prob
+                        else:
+                            kv_compress = compressor_out
                     kv = torch.cat([kv, kv_compress], dim=1)
 
         # ── Compute indices after Compressor has run ──
@@ -629,14 +634,18 @@ class CSAAttention(Attention):
             else:
                 # HCA dynamic index generation (no indexer)
                 cache_cap = self.kv_cache.shape[1] - win
-                cache_len = max(
-                    1,
-                    min(self.compressor.cache_write_ptr[:bsz].max().item(), cache_cap),
-                )
-                if start_pos == 0:
+                if self.training and start_pos == 0:
+                    cache_len = kv_compress.shape[1]
+                    fired_positions = fired_indices_tensor[:, :cache_len]
+                else:
+                    cache_len = max(
+                        1,
+                        min(self.compressor.cache_write_ptr[:bsz].max().item(), cache_cap),
+                    )
                     fired_positions = self.compressor.fired_indices_buf[
                         :bsz, :cache_len
                     ]
+                if start_pos == 0:
                     query_positions = torch.arange(seqlen, device=x.device).view(
                         1, seqlen, 1
                     )
@@ -886,21 +895,26 @@ class HCAAttention(Attention):
 
         # ── Run Compressor/Caching First if start_pos == 0 ──
         if start_pos == 0:
-            if seqlen <= win:
-                self.kv_cache[:bsz, :seqlen] = kv
-            else:
-                cutoff = seqlen % win
-                self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = kv[
-                    :, -win:
-                ].split([win - cutoff, cutoff], dim=1)
+            if not self.training:
+                if seqlen <= win:
+                    self.kv_cache[:bsz, :seqlen] = kv
+                else:
+                    cutoff = seqlen % win
+                    self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = kv[
+                        :, -win:
+                    ].split([win - cutoff, cutoff], dim=1)
             if self.compress_ratio:
                 compressor_out = self.compressor(x, start_pos, r_step=r_step)
                 if compressor_out is not None:
-                    if isinstance(compressor_out, tuple):
-                        kv_compress, event_prob = compressor_out
+                    if self.training:
+                        kv_compress, event_prob, fired_indices_tensor = compressor_out
                         self._last_event_prob = event_prob
                     else:
-                        kv_compress = compressor_out
+                        if isinstance(compressor_out, tuple):
+                            kv_compress, event_prob = compressor_out
+                            self._last_event_prob = event_prob
+                        else:
+                            kv_compress = compressor_out
                     kv = torch.cat([kv, kv_compress], dim=1)
 
         # ── Compute indices after Compressor has run ──
@@ -910,18 +924,23 @@ class HCAAttention(Attention):
             offset = seqlen if start_pos == 0 else win
             # HCA dynamic index path (no learned indexer)
             cache_cap = self.kv_cache.shape[1] - win
-            ptr_val = self.compressor.cache_write_ptr[:bsz].max().item()
-            if push_attention_debug is not None:
-                push_attention_debug(
-                    layer_id=self.layer_id,
-                    bsz=bsz,
-                    cache_write_ptr=self.compressor.cache_write_ptr[:bsz].tolist(),
-                    ptr_val=ptr_val,
-                    cache_cap=cache_cap,
-                )
-            cache_len = max(1, min(ptr_val, cache_cap))
-            if start_pos == 0:
+            if self.training and start_pos == 0:
+                cache_len = kv_compress.shape[1]
+                fired_positions = fired_indices_tensor[:, :cache_len]
+            else:
+                ptr_val = self.compressor.cache_write_ptr[:bsz].max().item()
+                if push_attention_debug is not None:
+                    push_attention_debug(
+                        layer_id=self.layer_id,
+                        bsz=bsz,
+                        cache_write_ptr=self.compressor.cache_write_ptr[:bsz].tolist(),
+                        ptr_val=ptr_val,
+                        cache_cap=cache_cap,
+                    )
+                cache_len = max(1, min(ptr_val, cache_cap))
                 fired_positions = self.compressor.fired_indices_buf[:bsz, :cache_len]
+
+            if start_pos == 0:
                 query_positions = torch.arange(seqlen, device=x.device).view(
                     1, seqlen, 1
                 )
@@ -1127,21 +1146,29 @@ class HybridSlidingGlobal(Attention):
         win = self.window_size
 
         if start_pos == 0:
-            if N <= win:
-                self.local_k_cache[:B, :N] = self._local_k
-                self.local_v_cache[:B, :N] = self._local_v
+            if self.training:
+                if N <= win:
+                    K = self._local_k.unsqueeze(1)
+                    V = self._local_v.unsqueeze(1)
+                else:
+                    K = self._local_k[:, -win:].unsqueeze(1)
+                    V = self._local_v[:, -win:].unsqueeze(1)
             else:
-                cutoff = N % win
-                k_chunks = self._local_k[:, -win:].split([win - cutoff, cutoff], dim=1)
-                v_chunks = self._local_v[:, -win:].split([win - cutoff, cutoff], dim=1)
-                self.local_k_cache[:B, cutoff:win] = k_chunks[0]
-                self.local_k_cache[:B, :cutoff] = k_chunks[1]
-                self.local_v_cache[:B, cutoff:win] = v_chunks[0]
-                self.local_v_cache[:B, :cutoff] = v_chunks[1]
-            self._local_cache_valid_len = min(N, win)
+                if N <= win:
+                    self.local_k_cache[:B, :N] = self._local_k
+                    self.local_v_cache[:B, :N] = self._local_v
+                else:
+                    cutoff = N % win
+                    k_chunks = self._local_k[:, -win:].split([win - cutoff, cutoff], dim=1)
+                    v_chunks = self._local_v[:, -win:].split([win - cutoff, cutoff], dim=1)
+                    self.local_k_cache[:B, cutoff:win] = k_chunks[0]
+                    self.local_k_cache[:B, :cutoff] = k_chunks[1]
+                    self.local_v_cache[:B, cutoff:win] = v_chunks[0]
+                    self.local_v_cache[:B, :cutoff] = v_chunks[1]
+                self._local_cache_valid_len = min(N, win)
 
-            K = self.local_k_cache[:B, : min(N, win)].unsqueeze(1)
-            V = self.local_v_cache[:B, : min(N, win)].unsqueeze(1)
+                K = self.local_k_cache[:B, : min(N, win)].unsqueeze(1)
+                V = self.local_v_cache[:B, : min(N, win)].unsqueeze(1)
             is_causal = True
             mask = None
         else:
@@ -1197,7 +1224,6 @@ class HybridSlidingGlobal(Attention):
         """Full-context MHA for global heads.  q_global: (B, N, Gh, Dh)."""
         B, N, Gh, Dh = q_global.shape
         gcache = self.global_k_cache.shape[1]
-        ptr = int(self.global_write_ptr.item())
 
         K_g = self._global_k.reshape(B, N, Gh, Dh)
         V_g = self._global_v.reshape(B, N, Gh, Dh)
@@ -1205,14 +1231,23 @@ class HybridSlidingGlobal(Attention):
         if start_pos == 0:
             # Prefill: write up to gcache tokens
             write_len = min(N, gcache)
-            self.global_k_cache[:B, :write_len] = K_g[:, :write_len].reshape(
-                B, write_len, Gh * Dh
-            )
-            self.global_v_cache[:B, :write_len] = V_g[:, :write_len].reshape(
-                B, write_len, Gh * Dh
-            )
-            self.global_write_ptr[0] = write_len
+            if self.training:
+                K_cache = K_g[:, :write_len]
+                V_cache = V_g[:, :write_len]
+            else:
+                self.global_k_cache[:B, :write_len] = K_g[:, :write_len].reshape(
+                    B, write_len, Gh * Dh
+                )
+                self.global_v_cache[:B, :write_len] = V_g[:, :write_len].reshape(
+                    B, write_len, Gh * Dh
+                )
+                self.global_write_ptr[0] = write_len
+                K_cache = self.global_k_cache[:B, :write_len].reshape(B, write_len, Gh, Dh)
+                V_cache = self.global_v_cache[:B, :write_len].reshape(B, write_len, Gh, Dh)
+            is_causal = True
+            mask = None
         else:
+            ptr = int(self.global_write_ptr.item())
             # Autoregressive: append one token (circular eviction)
             slot = ptr % gcache
             self.global_k_cache[:B, slot] = K_g[:, 0].reshape(B, Gh * Dh)
@@ -1221,24 +1256,24 @@ class HybridSlidingGlobal(Attention):
                 2 * gcache
             )  # allow overflow tracking
 
-        # Full KV for attention: use up to min(ptr, gcache) cached tokens
-        avail = min(ptr if start_pos > 0 else N, gcache)
-        if start_pos > 0 and N == 1:
-            # Single step decode: use only the valid portion of the global cache
-            valid_global = min(ptr + 1, gcache)
-            K_cache = self.global_k_cache[:B, :valid_global].reshape(
-                B, valid_global, Gh, Dh
-            )
-            V_cache = self.global_v_cache[:B, :valid_global].reshape(
-                B, valid_global, Gh, Dh
-            )
-            is_causal = False
-            mask = None
-        else:
-            K_cache = self.global_k_cache[:B, :avail].reshape(B, avail, Gh, Dh)
-            V_cache = self.global_v_cache[:B, :avail].reshape(B, avail, Gh, Dh)
-            is_causal = start_pos == 0 and N > 1
-            mask = None
+            # Full KV for attention: use up to min(ptr, gcache) cached tokens
+            avail = min(ptr if start_pos > 0 else N, gcache)
+            if start_pos > 0 and N == 1:
+                # Single step decode: use only the valid portion of the global cache
+                valid_global = min(ptr + 1, gcache)
+                K_cache = self.global_k_cache[:B, :valid_global].reshape(
+                    B, valid_global, Gh, Dh
+                )
+                V_cache = self.global_v_cache[:B, :valid_global].reshape(
+                    B, valid_global, Gh, Dh
+                )
+                is_causal = False
+                mask = None
+            else:
+                K_cache = self.global_k_cache[:B, :avail].reshape(B, avail, Gh, Dh)
+                V_cache = self.global_v_cache[:B, :avail].reshape(B, avail, Gh, Dh)
+                is_causal = start_pos == 0 and N > 1
+                mask = None
 
         K_c = K_cache.permute(0, 2, 1, 3).to(q_global.dtype)
         V_c = V_cache.permute(0, 2, 1, 3).to(q_global.dtype)

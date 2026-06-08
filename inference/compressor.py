@@ -342,18 +342,13 @@ class Compressor(nn.Module):
             num_complete_fires_dyn = max(
                 1, int(num_complete_fires_per_sample.max().item())
             )
-            if self.training:
-                if r_step not in self._saved_num_fires:
-                    self._saved_num_fires[r_step] = num_complete_fires_dyn
-                num_complete_fires = self._saved_num_fires[r_step]
-            else:
-                num_complete_fires = num_complete_fires_dyn
+            num_complete_fires = num_complete_fires_dyn
             if push_compressor_debug is not None:
                 push_compressor_debug(
                     layer_id=getattr(self, "layer_id", -1),
                     r_step=r_step,
                     training=self.training,
-                    saved_num_fires=self._saved_num_fires,
+                    saved_num_fires=None,
                     num_complete_fires_dyn=num_complete_fires_dyn,
                     num_complete_fires=num_complete_fires,
                 )
@@ -446,21 +441,22 @@ class Compressor(nn.Module):
             cache_cap = self.kv_cache.shape[1]
             write_len = min(num_complete_fires, cache_cap)
 
-            with torch.no_grad():
-                self.kv_cache[:bsz, :write_len] = kv_out[:, :write_len].detach()
-                self.fired_indices_buf[:bsz, :write_len] = fired_indices_tensor[
-                    :, :write_len
-                ]
-                self.cache_write_ptr[:bsz] = write_len
+            if not self.training:
+                with torch.no_grad():
+                    self.kv_cache[:bsz, :write_len] = kv_out[:, :write_len].detach()
+                    self.fired_indices_buf[:bsz, :write_len] = fired_indices_tensor[
+                        :, :write_len
+                    ]
+                    self.cache_write_ptr[:bsz] = write_len
 
-                # 12. Carry over the incomplete remainder to autoregressive state
-                self.kv_accumulator[:bsz] = accum_kv.detach()
-                self.gate_accumulator[:bsz] = accum_gate.detach()
-                self.fire_threshold[:bsz] = accum_prob.detach()
+                    # 12. Carry over the incomplete remainder to autoregressive state
+                    self.kv_accumulator[:bsz] = accum_kv.detach()
+                    self.gate_accumulator[:bsz] = accum_gate.detach()
+                    self.fire_threshold[:bsz] = accum_prob.detach()
 
             # Return kv_out and event_prob (sigmoid-bounded) for CIF loss (only in training/prefill)
             if self.training:
-                return kv_out, torch.sigmoid(raw_alpha)
+                return kv_out, torch.sigmoid(raw_alpha), fired_indices_tensor
             return kv_out
         else:
             # ─────────────────────────────────────────────────────────
