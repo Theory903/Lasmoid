@@ -247,7 +247,10 @@ import torch
 
 # ── Tokenizer (Lasmoid BPE, 129,286 vocab) ──────────────────────────────────
 TOK_PATH = str(REPO_DIR)   # tokenizer.json lives at repo root
-tokenizer = AutoTokenizer.from_pretrained(TOK_PATH, use_fast=True)
+try:
+    tokenizer = AutoTokenizer.from_pretrained(TOK_PATH, use_fast=True, fix_mistral_regex=True)
+except Exception:
+    tokenizer = AutoTokenizer.from_pretrained(TOK_PATH, use_fast=True)
 tokenizer.pad_token = tokenizer.eos_token
 VOCAB_SIZE = len(tokenizer)
 print(f"Tokenizer vocab size: {VOCAB_SIZE:,}")

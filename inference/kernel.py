@@ -499,7 +499,13 @@ def sparse_attn(
     kv_exp  = kv.unsqueeze(1).expand(-1, S, -1, -1)
     kv_gathered = torch.gather(kv_exp, 2, idx_exp)
 
-    scores = torch.einsum("bshd,bstd->bsht", q.float(), kv_gathered.float()) * softmax_scale
+    if q.dtype != kv_gathered.dtype:
+        q_c = q.float()
+        kv_c = kv_gathered.float()
+    else:
+        q_c = q
+        kv_c = kv_gathered
+    scores = torch.einsum("bshd,bstd->bsht", q_c, kv_c).float() * softmax_scale
     
     if pair_bias is not None:
         scores = scores + pair_bias.float()

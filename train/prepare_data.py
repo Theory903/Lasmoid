@@ -38,7 +38,10 @@ import transformers
 def setup_tokenizer(tokenizer_path):
     print(f"Loading tokenizer from: {tokenizer_path}")
     try:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer_path)
+        try:
+            tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer_path, fix_mistral_regex=True)
+        except Exception:
+            tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer_path)
     except Exception as e:
         print(f"Standard AutoTokenizer failed to load ({e}). Falling back to PreTrainedTokenizerFast...")
         try:

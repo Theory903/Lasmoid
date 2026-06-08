@@ -241,7 +241,10 @@ cells.append(
 from transformers import AutoTokenizer
 
 TOK_PATH  = str(REPO_DIR)
-tokenizer = AutoTokenizer.from_pretrained(TOK_PATH, use_fast=True)
+try:
+    tokenizer = AutoTokenizer.from_pretrained(TOK_PATH, use_fast=True, fix_mistral_regex=True)
+except Exception:
+    tokenizer = AutoTokenizer.from_pretrained(TOK_PATH, use_fast=True)
 
 if tokenizer.pad_token_id is None:
     tokenizer.pad_token_id = 0

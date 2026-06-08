@@ -10,10 +10,19 @@ Delegates Muon optimiser to optimizer.py and reward functions to reward.py.
 
 import os
 import sys
+
+# Optimize PyTorch memory allocations to avoid fragmentation
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
 import argparse
 import urllib.request
 import json
 import torch
+if torch.cuda.is_available():
+    try:
+        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+    except Exception:
+        pass
 import warnings
 
 # Monkey-patch torch.bf16 for compatibility with older/custom PyTorch versions in transformers
@@ -142,7 +151,12 @@ def train():
     if master_process:
         print(f"Loading tokenizer from: {tokenizer_path}")
     try:
-        enc = transformers.AutoTokenizer.from_pretrained(tokenizer_path)
+        try:
+            enc = transformers.AutoTokenizer.from_pretrained(
+                tokenizer_path, fix_mistral_regex=True
+            )
+        except Exception:
+            enc = transformers.AutoTokenizer.from_pretrained(tokenizer_path)
     except Exception as e:
         if master_process:
             print(
@@ -355,6 +369,9 @@ def train():
         raw_model = model.module
     else:
         raw_model = model
+
+    # Enable gradient checkpointing to save memory on Kaggle GPUs
+    raw_model.gradient_checkpointing = True
 
     if master_process:
         print(

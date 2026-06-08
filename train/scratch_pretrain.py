@@ -48,6 +48,11 @@ from typing import Iterator, Optional
 from collections import defaultdict
 
 import torch
+if torch.cuda.is_available():
+    try:
+        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+    except Exception:
+        pass
 import warnings
 
 # Monkey-patch torch.bf16 for compatibility with older/custom PyTorch versions in transformers
@@ -570,7 +575,10 @@ def train():
 
     # ── Tokenizer ─────────────────────────────────────────────────────────────
     TOK_PATH = str(_PROJECT_ROOT)
-    tokenizer = AutoTokenizer.from_pretrained(TOK_PATH, use_fast=True)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(TOK_PATH, use_fast=True, fix_mistral_regex=True)
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained(TOK_PATH, use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
     assert len(tokenizer) == VOCAB_SIZE, (
         f"Tokenizer vocab ({len(tokenizer)}) != config vocab ({VOCAB_SIZE})"
