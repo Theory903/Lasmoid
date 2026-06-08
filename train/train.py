@@ -144,12 +144,17 @@ def train():
                 tokenizer_path, fix_mistral_regex=True
             )
         except Exception as e_fast:
-            if master_process:
-                print(f"Error: Failed to load tokenizer from '{tokenizer_path}'.")
-                print(f"Detailed error: {e_fast}")
-                print(
-                    "\nIf you are loading a gated Hugging Face model (such as Gemma), make sure:"
+            try:
+                enc = transformers.PreTrainedTokenizerFast.from_pretrained(
+                    tokenizer_path
                 )
+            except Exception as e_fast2:
+                if master_process:
+                    print(f"Error: Failed to load tokenizer from '{tokenizer_path}'.")
+                    print(f"Detailed error: {e_fast2}")
+                    print(
+                        "\nIf you are loading a gated Hugging Face model (such as Gemma), make sure:"
+                    )
                 print(
                     "1. You have accepted the license terms on Hugging Face model page."
                 )

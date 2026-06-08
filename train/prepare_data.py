@@ -35,12 +35,15 @@ def setup_tokenizer(tokenizer_path):
         try:
             tokenizer = transformers.PreTrainedTokenizerFast.from_pretrained(tokenizer_path, fix_mistral_regex=True)
         except Exception as e_fast:
-            print(f"Error: Failed to load tokenizer from '{tokenizer_path}'.")
-            print(f"Detailed error: {e_fast}")
-            print("\nIf you are loading a gated Hugging Face model (such as Gemma), make sure:")
-            print("1. You have accepted the license terms on Hugging Face model page.")
-            print("2. You are logged in using 'huggingface-cli login' or have set 'HF_TOKEN' environment variable.")
-            sys.exit(1)
+            try:
+                tokenizer = transformers.PreTrainedTokenizerFast.from_pretrained(tokenizer_path)
+            except Exception as e_fast2:
+                print(f"Error: Failed to load tokenizer from '{tokenizer_path}'.")
+                print(f"Detailed error: {e_fast2}")
+                print("\nIf you are loading a gated Hugging Face model (such as Gemma), make sure:")
+                print("1. You have accepted the license terms on Hugging Face model page.")
+                print("2. You are logged in using 'huggingface-cli login' or have set 'HF_TOKEN' environment variable.")
+                sys.exit(1)
 
     if tokenizer.eos_token_id is None:
         tokenizer.eos_token_id = 1

@@ -139,7 +139,10 @@ def pretrain():
     model_args = ModelArgs(**filtered_config)
 
     # Load tokenizer and fallback dataset
-    enc = transformers.PreTrainedTokenizerFast.from_pretrained(lasmoid_dir, fix_mistral_regex=True)
+    try:
+        enc = transformers.PreTrainedTokenizerFast.from_pretrained(lasmoid_dir, fix_mistral_regex=True)
+    except Exception:
+        enc = transformers.PreTrainedTokenizerFast.from_pretrained(lasmoid_dir)
     model_args.vocab_size = len(enc)
 
     dataset_path = "input.txt"

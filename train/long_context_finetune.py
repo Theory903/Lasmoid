@@ -197,7 +197,10 @@ def main():
     model_args = ModelArgs(**filtered_config)
 
     lasmoid_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    enc = transformers.PreTrainedTokenizerFast.from_pretrained(lasmoid_dir, fix_mistral_regex=True)
+    try:
+        enc = transformers.PreTrainedTokenizerFast.from_pretrained(lasmoid_dir, fix_mistral_regex=True)
+    except Exception:
+        enc = transformers.PreTrainedTokenizerFast.from_pretrained(lasmoid_dir)
     model_args.vocab_size = len(enc)
 
     model = Lasmoid(model_args).to(device)

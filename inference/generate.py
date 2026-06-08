@@ -333,9 +333,14 @@ def main(
     Linear.scale_fmt = getattr(args, "scale_fmt", None)
 
     lasmoid_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    enc = transformers.PreTrainedTokenizerFast.from_pretrained(
-        lasmoid_dir, fix_mistral_regex=True
-    )
+    try:
+        enc = transformers.PreTrainedTokenizerFast.from_pretrained(
+            lasmoid_dir, fix_mistral_regex=True
+        )
+    except Exception:
+        enc = transformers.PreTrainedTokenizerFast.from_pretrained(
+            lasmoid_dir
+        )
     eos_token_id = enc.eos_token_id if enc.eos_token_id is not None else 1
 
     sampler_cfg = dict(
