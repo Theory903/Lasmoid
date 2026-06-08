@@ -126,16 +126,18 @@ class QuantKVCache(nn.Module):
         self.cache_s.detach_().zero_()
 
     def write(self, kv: torch.Tensor, slot_start: int, slot_end: int) -> None:
-        """Quantise *kv* and store in ``cache_q[:, start:end]`` / ``cache_s``."""
+        """Quantise *kv* and store in ``cache_q[:B, start:end]`` / ``cache_s[:B]``."""
+        B = kv.shape[0]
         q, s = quantize_kv(kv.contiguous(), self.block_size, self.scale_dtype)
-        self.cache_q[:, slot_start:slot_end] = q
-        self.cache_s[:, slot_start:slot_end] = s
+        self.cache_q[:B, slot_start:slot_end] = q
+        self.cache_s[:B, slot_start:slot_end] = s
 
     def read(self, slot_start: int, slot_end: int) -> torch.Tensor:
-        """Dequantise ``cache_q[:, start:end]`` back to BF16."""
+        """Dequantise ``cache_q[:B, start:end]`` back to BF16."""
+        B = self._bsz
         return dequantize_kv(
-            self.cache_q[:, slot_start:slot_end],
-            self.cache_s[:, slot_start:slot_end],
+            self.cache_q[:B, slot_start:slot_end],
+            self.cache_s[:B, slot_start:slot_end],
             self.block_size,
         )
 
